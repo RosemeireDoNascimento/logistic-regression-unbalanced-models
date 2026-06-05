@@ -25,3 +25,11 @@ Execute os scripts na pasta scripts na seguinte ordem:
 1. simulacao.R
 2. modelos.R
 3. metricas.R
+
+## Dados
+
+Os dados utilizados neste estudo estão disponíveis em:
+
+https://archive.ics.uci.edu/dataset/176/blood+transfusion+service+center
+https://www.kaggle.com/c/santander-customer-transaction-prediction
+{https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud
