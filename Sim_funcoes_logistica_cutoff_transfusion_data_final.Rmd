@@ -1,0 +1,621 @@
+---
+title: "Sim_funcoes_logistica_cutoff_transfusion_data"
+author: "Rosemeire do Nascimento"
+date: "2026-02-25"
+output: pdf_document
+---
+
+
+```{r}
+# 1. CARREGAMENTO DE PACOTES
+library(tidyverse)
+library(ggplot2)
+library(caret)    
+library(maxLik)   
+library(powdist)  
+library(pROC)
+library(future)
+library(future.apply)
+library(tibble)
+library(dplyr)
+
+```
+
+
+
+
+
+
+
+```{r}
+# 1. Configurações e variáveis globais ---------------------------------------
+set.seed(1234)
+
+# Epsilon para estabilidade numérica
+EPS_PROB <- 1e-12
+
+# Configurações de memória e paralellismo
+# plan(multisession, workers = 3) 
+# 
+# options(future.globals.maxSize = 4 * 1024^3) # 8GB para lidar com o dataset
+# 
+# cat("Configuração paralela: multicore (Linux) com", parallel::detectCores() - 1, "workers.\n")
+
+```
+
+
+
+
+
+
+
+```{r}
+# 2. Carregar base real -------------------------------------------------------
+
+dados <- read.csv("transfusion.data.csv")
+
+
+# Ajustar nomes das colunas (caso venham longos)
+colnames(dados) <- c("Recency", "Frequency", "Monetary", "Time", "Class")
+dados <- dados %>% select(-Monetary)
+
+dim(dados)
+str(dados)
+summary(dados)
+
+# ----------------------------
+# Objetos derivados da base
+# ----------------------------
+
+N_DATA   <- nrow(dados)
+
+predictors <- setdiff(names(dados), "Class")
+P_FEATURES <- length(predictors)
+
+dados[,predictors] <- scale(dados[,predictors])
+
+# ----------------------------
+# Análise da Variável Resposta
+# ----------------------------
+
+dados$Class <- factor(dados$Class, levels = c(0,1))
+
+table(dados$Class)
+prop.table(table(dados$Class))
+
+# ----------------------------
+# Estatísticas por classe
+# ----------------------------
+
+aggregate(. ~ Class, data = dados, mean)
+
+# ----------------------------
+# Correlação entre preditores
+# ----------------------------
+
+cor_mat <- cor(dados[,1:3])
+cor_mat
+
+# ----------------------------
+# Separação inicial via ROC
+# ----------------------------
+
+roc_obj <- sapply(predictors, function(var){
+  roc(dados$Class,
+      dados[[var]],
+      levels = c(0,1),
+      direction = "<",
+      quiet = TRUE) |> auc()
+})
+
+tibble(Variavel = names(roc_obj),
+       AUC = as.numeric(roc_obj)) %>%
+  arrange(desc(AUC))
+
+tibble(Variavel = names(roc_obj),
+       AUC = as.numeric(roc_obj)) %>%
+  ggplot(aes(x = reorder(Variavel, AUC), y = AUC)) +
+  geom_col(fill="steelblue") +
+  coord_flip() +
+  theme_minimal()
+
+form_glm <- as.formula(
+  paste("Class ~", paste(predictors, collapse = "+"))
+)
+
+prop_real  <- mean(as.numeric(as.character(dados$Class)) == 1)
+
+cat("Número total de observações:", N_DATA, "\n")
+cat("Número de preditores:", P_FEATURES, "\n")
+cat("Proporção real classe 1:", prop_real, "\n")
+
+```
+
+
+
+
+
+
+
+```{r}
+# 3. Funções utilitárias -----------------------------------------------------
+# Extrai métricas de confusionMatrix (com proteção quando cm é NULL)
+# utilitarias
+get_metrics <- function(cm_object, prop, method_name, cutoff_used = NA_real_, auc_roc = NA_real_, auc_pr = NA_real_) {
+  
+  # Caso o modelo ou a Confusion Matrix falhem
+  if (is.null(cm_object)) {
+    return(tibble(
+      Method = method_name,
+      Cutoff = cutoff_used,
+      Accuracy = NA_real_,
+      AUC = NA_real_,
+      AUC_PR = NA_real_,
+      Kappa = NA_real_,
+      Sensitivity = NA_real_,
+      Specificity = NA_real_,
+      Pos_Pred_Value = NA_real_,
+      Neg_Pred_Value = NA_real_,
+      Balanced_Accuracy = NA_real_,
+      F1 = NA_real_,
+      Error = "model_or_cm_failed"
+    ))
+  }
+  
+  # # ---------------------------
+  # # AUC-ROC
+  # # ---------------------------
+  # roc_obj <- tryCatch(
+  #   pROC::roc(labels, probs, quiet = TRUE),
+  #   error = function(e) NULL
+  # )
+  # 
+  # auc_val <- if (!is.null(roc_obj)) {
+  #   as.numeric(pROC::auc(roc_obj))
+  # } else {
+  #   NA_real_
+  # }
+  # 
+  # # ---------------------------
+  # # AUC-PR
+  # # ---------------------------
+  # pr_obj <- tryCatch({
+  # 
+  #   PRROC::pr.curve(
+  #     scores.class0 = probs[labels == "1"],
+  #     scores.class1 = probs[labels == "0"],
+  #     curve = FALSE
+  #   )
+  # 
+  # }, error = function(e) NULL)
+  # 
+  # auc_pr_val <- if (!is.null(pr_obj)) {
+  #   pr_obj$auc.integral
+  # } else {
+  #   NA_real_
+  # }
+  
+  # Tibble consolidada com todas as métricas para a tese
+  tibble(
+    Method = method_name,
+    Cutoff = cutoff_used,
+    AUC               = auc_roc,
+    AUC_PR            = auc_pr,
+    Accuracy          = as.numeric(cm_object$overall["Accuracy"]),
+    Kappa             = as.numeric(cm_object$overall["Kappa"]),
+    Sensitivity       = as.numeric(cm_object$byClass["Sensitivity"]),
+    Specificity       = as.numeric(cm_object$byClass["Specificity"]),
+    Pos_Pred_Value    = as.numeric(cm_object$byClass["Pos Pred Value"]), # Precisão
+    Neg_Pred_Value    = as.numeric(cm_object$byClass["Neg Pred Value"]), # NPV
+    Balanced_Accuracy = as.numeric(cm_object$byClass["Balanced Accuracy"]),
+    F1                = as.numeric(cm_object$byClass["F1"]),
+    Error = NA_character_
+  )
+}
+
+
+
+# Calcula o melhor ponto de corte (Youden Index) via Curva ROC
+compute_cutoff <- function(y_true_factor, probs, fallback) {
+  # 1. Verificações de entrada
+  probs <- as.numeric(probs)
+  if (length(probs) != length(y_true_factor)) return(fallback)
+  
+  # 2. Garante que os níveis são 0 e 1 e lida com predições únicas
+  y_true_factor <- factor(y_true_factor, levels = c("0", "1"))
+  if (length(unique(probs)) <= 1) return(fallback)
+  
+  # 3. Cálculo ROC
+  roc_obj <- tryCatch(pROC::roc(y_true_factor, probs, quiet = TRUE), error = function(e) NULL)
+  if (is.null(roc_obj)) return(fallback)
+  
+  # 4. Extração do Threshold Otimizado
+  th <- tryCatch(pROC::coords(roc_obj, "best", ret = "threshold", transpose = FALSE), 
+                 error = function(e) NULL)
+  
+  # 5. COERÇÃO ROBUSTA (Correção principal): 
+  # Usa unlist para lidar com listas/tibbles complexas e pega o primeiro valor
+  th_numeric <- if (!is.null(th)) as.numeric(unlist(th))[1] else NA_real_
+  
+  # 6. Verificação de falha
+  if (is.na(th_numeric) || length(th_numeric) < 1) return(fallback) 
+  
+  return(th_numeric)
+}
+
+safe_confusion <- function(y_true, y_pred) {
+  y_true <- as.character(y_true)
+  y_pred <- as.character(y_pred)
+  if (length(y_true) != length(y_pred)) return(NULL)
+  y_true_f <- factor(y_true, levels = c("0","1"))
+  y_pred_f <- factor(y_pred, levels = c("0","1"))
+  cm <- tryCatch(caret::confusionMatrix(y_pred_f, y_true_f, positive = "1"), error = function(e) NULL)
+  return(cm)
+}
+
+```
+
+
+
+
+
+
+
+```{r}
+# 4. Funções de log-verossimilhança para PL e RPL -----------------------------
+logvero.PL <- function(param, y, x) {
+   k <- ncol(x)
+  beta <- param[1:k]
+  lambda.star <- param[k+1]
+  lambda <- exp(lambda.star)
+  
+  eta <- as.numeric(x %*% beta)
+  
+  p <- powdist::pplogis(q = eta, mu = 0, sigma = 1, lambda = lambda)
+  
+  p <- pmin(pmax(p, EPS_PROB), 1 - EPS_PROB)
+  
+  sum(y * log(p) + (1-y) * log(1-p))
+}
+
+logvero.RPL <- function(param, y, x) {
+  k <- ncol(x)
+  beta <- param[1:k]
+  lambda.star <- param[k+1]
+  lambda <- exp(lambda.star)
+  
+  eta <- as.numeric(x %*% beta)
+  
+  p <- powdist::prplogis(q = eta, mu = 0, sigma = 1, lambda = lambda)
+  
+  p <- pmin(pmax(p, EPS_PROB), 1 - EPS_PROB)
+  
+  sum(y * log(p) + (1-y) * log(1-p))
+}
+
+```
+
+
+
+
+
+
+
+
+```{r}
+# 5. Funções de ajuste dos modelos -----------
+
+# --- Função para Modelos de Máxima Verossimilhança (PL e RPL) ---
+fit_model_maxLik <- function(train, test, function_vero, method_name) {
+
+  y_train <- as.numeric(as.character(train$Class))
+  
+  # Garantia do Intercepto: Adicionamos a coluna de 1s aqui (uma única vez)
+  x_train <- cbind(Intercepto = 1, as.matrix(train[, predictors]))
+  x_test  <- cbind(Intercepto = 1, as.matrix(test[, predictors]))
+
+  # Vetor inicial: k colunas (incluindo intercepto) + 1 parâmetro lambda
+  start <- rep(0, ncol(x_train) + 1)
+  start[length(start)] <- log(0.5) # Chute inicial para lambda=1
+
+  est <- tryCatch(
+    maxLik(
+      logLik  = function_vero,
+      start   = start,
+      y       = y_train,
+      x       = x_train,
+      method  = "BFGSR",
+      control = list(iterlim = 100000)
+    ),
+    error = function(e) {
+      message(paste("Erro no ajuste maxLik (", method_name, "):", e$message))
+      return(NULL)
+    }
+  )
+
+  # Se falhar ou gerar NA, retorna métricas vazias
+  if (is.null(est) || any(is.na(est$estimate))) {
+    return(get_metrics(NULL, prop_real, method_name))
+  }
+
+  # Extração dos parâmetros estimados
+  beta_full <- est$estimate[1:(length(est$estimate)-1)]
+  lambda    <- exp(est$estimate[length(est$estimate)])
+
+  # Cálculo do preditor linear (eta) e probabilidade (p_pred)
+  eta <- as.numeric(x_test %*% beta_full)
+
+  p_pred <- if (identical(function_vero, logvero.PL)) {
+    powdist::pplogis(eta, mu = 0, sigma = 1, lambda = lambda)
+  } else {
+    powdist::prplogis(eta, mu = 0, sigma = 1, lambda = lambda)
+  }
+
+  # Estabilização e Cutoff
+  p_pred <- pmin(pmax(p_pred, EPS_PROB), 1 - EPS_PROB)
+  
+  # Cálculo da AUC-ROC via pROC
+  roc_obj <- tryCatch(pROC::roc(test$Class, p_pred, quiet = TRUE), error = function(e) NULL)
+  v_auc_roc <- if(!is.null(roc_obj)) as.numeric(pROC::auc(roc_obj)) else NA_real_
+  
+  # Cálculo da AUC-PR via PRROC
+  # scores.class0 recebe as probabilidades da classe positiva (1) correspondente aos uns reais
+  # scores.class1 recebe as probabilidades da classe positiva (1) correspondente aos zeros reais
+  pr_obj <- tryCatch({
+    PRROC::pr.curve(scores.class0 = p_pred[test$Class == "1"], 
+                    scores.class1 = p_pred[test$Class == "0"], 
+                    curve = FALSE)
+  }, error = function(e) NULL)
+  v_auc_pr <- if(!is.null(pr_obj)) pr_obj$auc.integral else NA_real_
+  
+  
+  cutoff <- compute_cutoff(test$Class, p_pred, fallback = prop_real)
+  if (length(p_pred) != nrow(test)) return(get_metrics(NULL, prop_real, method_name, cutoff, v_auc_roc, v_auc_pr))
+  pred   <- ifelse(p_pred >= cutoff, "1", "0")
+
+  cm <- safe_confusion(test$Class, pred)
+  get_metrics(cm, prop_real, method_name, cutoff, v_auc_roc, v_auc_pr)
+}
+
+# --- Função para Logistica com Pesos (Calculados no Treino) ---
+# --- Função para Logistica com Pesos Normalizados (Estabilidade Técnica) ---
+fit_model_glm_weighted <- function(train, test) {
+  
+  y_train_num <- as.numeric(as.character(train$Class))
+  
+  # Cálculo de pesos normalizados (Soma dos pesos = N)
+  # Isso mantém a escala da verossimilhança estável e evita NaNs
+  n1 <- sum(y_train_num == 1)
+  n0 <- sum(y_train_num == 0)
+  n_train <- n0 + n1
+  w1 <- n0 / n_train
+  w0 <- n1 / n_train
+
+  train$pesos_treino <- ifelse(y_train_num == 1, w1, w0)
+
+  est_glm <- tryCatch(
+    suppressWarnings(
+      glm(form_glm, data = train, family = binomial(link = "logit"), weights = pesos_treino)
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(est_glm)) return(get_metrics(NULL, prop_real, "Logistic_Weighted"))
+
+  # Calculamos o VIF para garantir que os pesos não "quebraram" a estabilidade dos preditores
+  vif_values <- tryCatch(car::vif(est_glm), error = function(e) NA)
+  
+  # Opcional: imprimir no console durante a execução para monitorar
+  # cat("\nVIF para Logistic_Weighted:\n"); print(vif_values)
+  
+  p_pred <- as.numeric(predict(est_glm, newdata = test, type = "response"))
+  p_pred <- pmin(pmax(p_pred, EPS_PROB), 1 - EPS_PROB)
+  
+  roc_obj <- tryCatch(pROC::roc(test$Class, p_pred, quiet = TRUE), error = function(e) NULL)
+  v_auc_roc <- if(!is.null(roc_obj)) as.numeric(pROC::auc(roc_obj)) else NA_real_
+  
+  pr_obj <- tryCatch({
+    PRROC::pr.curve(scores.class0 = p_pred[test$Class == "1"], 
+                    scores.class1 = p_pred[test$Class == "0"], 
+                    curve = FALSE)
+  }, error = function(e) NULL)
+  v_auc_pr <- if(!is.null(pr_obj)) pr_obj$auc.integral else NA_real_
+
+  cutoff <- compute_cutoff(test$Class, p_pred, fallback = prop_real)
+  pred   <- ifelse(p_pred >= cutoff, "1", "0")
+
+  cm <- safe_confusion(test$Class, pred)
+  get_metrics(cm, prop_real, "Logistic_Weighted", cutoff, v_auc_roc, v_auc_pr)
+}
+
+
+# --- Função para Logistica Padrão ---
+fit_model_glm_standard <- function(train, test) {
+
+  est_glm <- tryCatch(
+    suppressWarnings(glm(form_glm, data = train, family = binomial(link = "logit"))),
+    error = function(e) NULL
+  )
+
+  if (is.null(est_glm)) return(get_metrics(NULL, prop_real, "Logistic_Standard"))
+
+  p_pred <- as.numeric(predict(est_glm, newdata = test, type = "response"))
+  p_pred <- pmin(pmax(p_pred, EPS_PROB), 1 - EPS_PROB)
+  
+  roc_obj <- tryCatch(pROC::roc(test$Class, p_pred, quiet = TRUE), error = function(e) NULL)
+  v_auc_roc <- if(!is.null(roc_obj)) as.numeric(pROC::auc(roc_obj)) else NA_real_
+  
+  pr_obj <- tryCatch({
+    PRROC::pr.curve(scores.class0 = p_pred[test$Class == "1"], 
+                    scores.class1 = p_pred[test$Class == "0"], 
+                    curve = FALSE)
+  }, error = function(e) NULL)
+  v_auc_pr <- if(!is.null(pr_obj)) pr_obj$auc.integral else NA_real_
+
+  cutoff <- compute_cutoff(test$Class, p_pred, fallback = prop_real)
+  pred   <- ifelse(p_pred >= cutoff, "1", "0")
+
+  cm <- safe_confusion(test$Class, pred)
+  get_metrics(cm, prop_real, "Logistic_Standard", cutoff, v_auc_roc, v_auc_pr)
+}
+
+```
+
+
+
+
+
+
+
+```{r}
+# 6. Runner - Execução Única e Avaliação de Performance ----------------------
+
+# 6.1. Partição Única Estratificada
+# Usamos a base original (dados) sem o ruído do bootstrap. 
+# A estratificação garante que o treino e o teste mantenham a proporção de doadores.
+split <- rsample::initial_split(dados, prop = 0.75, strata = Class)
+train <- rsample::training(split)
+test  <- rsample::testing(split)
+
+message(sprintf("\n🚀 Iniciando Execução Única - Transfusion Data"))
+message(sprintf("   Observações (Treino/Teste): %d / %d", nrow(train), nrow(test)))
+time_start <- Sys.time()
+
+# 6.2. Ajuste dos Modelos em Sequência
+# Chamamos as funções simplificadas que definimos no Bloco 6.
+# Como não há mais loop, não passamos o 'sim_num'.
+
+  
+  cat("  -> Ajustando Logistic_Standard...\n")
+  standard <- fit_model_glm_standard(train, test)
+  
+  cat("  -> Ajustando Logistic_Weighted (Pesos no Treino)...\n")
+  weighted <- fit_model_glm_weighted(train, test)
+  
+  cat("  -> Ajustando Logistic_PL (Potencializada - Máxima Verossimilhança)...\n")
+  PL <- fit_model_maxLik(train, test, function_vero = logvero.PL, method_name = "Logistic_PL")
+  
+  cat("  -> Ajustando Logistic_RPL (Potencializada Reversa)...\n")
+  RPL <- fit_model_maxLik(train, test, function_vero = logvero.RPL, method_name = "Logistic_RPL")
+  
+  results <- bind_rows(standard, weighted, PL, RPL)
+
+
+time_end <- Sys.time()
+cat("\n🏁 Execução finalizada com sucesso!\n")
+print(time_end - time_start)
+
+# Exibir resultados preliminares no console
+print(results)
+
+```
+
+
+
+
+
+
+
+```{r}
+# 7. Agregação e Consolidação das Métricas ----------------------------------
+
+# Como é uma rodada única, a "média" será o próprio valor observado.
+# Esta estrutura facilita a plotagem dos gráficos logo em seguida.
+metric_summary <- results %>%
+  group_by(Method) %>%
+  summarise(
+    AUC                  = mean(AUC, na.rm = TRUE),
+    AUC_PR               = mean(AUC_PR, na.rm = TRUE),
+    Acuracia             = mean(Accuracy, na.rm = TRUE),
+    Acuracia_Balanceada  = mean(Balanced_Accuracy, na.rm = TRUE),
+    Sensibilidade        = mean(Sensitivity, na.rm = TRUE),
+    Especificidade       = mean(Specificity, na.rm = TRUE),
+    Precisao             = mean(Pos_Pred_Value, na.rm = TRUE),
+    NPV                  = mean(Neg_Pred_Value, na.rm = TRUE),
+    F1_Score             = mean(F1, na.rm = TRUE),
+    Kappa                = mean(Kappa, na.rm = TRUE),
+    Cutoff_Otimizado     = mean(Cutoff, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Exibir a tabela no console para conferência imediata
+print("--- Resumo Final das Métricas (Transfusion Data) ---")
+print(metric_summary)
+
+```
+
+
+
+
+
+
+
+```{r}
+
+# 8. Gráficos Comparativos (Multidimensionais) -------------------
+
+# 1. Transformar para formato longo incluindo todas as métricas calculadas
+metric_long <- metric_summary %>%
+  pivot_longer(
+    cols = c(AUC, AUC_PR, Acuracia, Acuracia_Balanceada, Sensibilidade, Especificidade, 
+             Precisao, NPV, F1_Score, Kappa),
+    names_to = "Metrica", 
+    values_to = "Valor"
+  ) %>%
+  # Organizando a ordem para facilitar a leitura lógica
+  mutate(Metrica = factor(Metrica, 
+                          levels = c("AUC", "AUC_PR", "Acuracia", "Acuracia_Balanceada", "Sensibilidade", 
+                                     "Especificidade", "Precisao", "NPV", "F1_Score", "Kappa")))
+
+# 2. Gerar o painel visual
+ggplot(metric_long, aes(x = Method, y = Valor, fill = Method)) +
+  geom_col(show.legend = FALSE, alpha = 0.8) +
+  # Rótulos automáticos em porcentagem
+  geom_text(aes(label = ifelse(is.na(Valor), "NA", scales::percent(Valor, accuracy = 0.1))),
+            vjust = -0.3, size = 2.5) +
+  # facet_wrap cria um sub-gráfico para cada métrica
+  facet_wrap(~ Metrica, ncol = 2, scales = "free_y") + 
+  scale_y_continuous(limits = c(0, 1.15), labels = scales::percent) +
+  labs(
+    title = "Comparativo de Performance",
+    subtitle = "Dataset: Blood Transfusion Service Center",
+    x = "Método de Ajuste", 
+    y = "Desempenho (%)"
+  ) +
+  theme_minimal() + 
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text = element_text(face = "bold", size = 10), # Títulos dos quadros
+    panel.spacing = unit(1, "lines")
+  )
+
+```
+
+
+
+
+
+
+
+```{r}
+# 9. Salvamento de Resultados e Gráficos ------------------------------------
+
+# 9.1. Salvamento da Tabela CSV
+# Usamos a metric_summary que contém todas as métricas consolidadas
+write.csv(metric_summary, 
+          "metricas_finais_transfusion_data.csv", 
+          row.names = FALSE)
+
+# 9.2. Salvamento do Gráfico em Alta Resolução (DPI 300)
+# O ggsave salva o último gráfico gerado pelo ggplot2
+ggsave("comparativo_modelos_transfusion.png", 
+       width = 10, 
+       height = 8, 
+       dpi = 300)
+
+# Mensagens de confirmação no console
+message("\n✅ Processamento concluído com sucesso!")
+message("   📊 Tabela salva em: 'metricas_finais_transfusion_data.csv'")
+message("   🖼️ Gráfico salvo em: 'comparativo_modelos_transfusion.png'")
+
+```

@@ -1,0 +1,543 @@
+---
+title: "Sim_funcoes_logistica_cutoff_paralelo"
+author: "Rosemeire do Nascimento"
+date: "20/03/2026"
+output: pdf_document
+---
+
+
+```{r}
+# 1. CARREGAMENTO DE PACOTES
+library(tidyverse)
+library(tidymodels)
+library(rsample)
+library(ggplot2)
+library(caret)    
+library(maxLik)   
+library(mvtnorm)  
+library(powdist)  
+library(pROC)
+library(PRROC)
+library(future)
+library(furrr)
+library(progressr)
+
+
+```
+
+
+
+
+
+
+
+```{r}
+future::plan(multicore, workers = 12)
+handlers(global = TRUE)
+```
+
+
+
+
+
+
+
+```{r}
+# 1. Configurações e variáveis globais ---------------------------------------
+set.seed(1234)
+
+
+# Número de features
+P_FEATURES <- 20
+
+
+# Parâmetros de simulação padrão (podem ser modificados pelo usuário)
+NUM_SIMULATIONS <- c(1000)
+CLASS_PROPORTIONS <- c(0.25, 0.10, 0.01)
+N_DATA <- 10000
+
+
+# Epsilon para estabilidade numérica
+EPS_PROB <- 1e-12
+
+```
+
+
+
+
+
+
+
+```{r}
+# 2. Funções utilitárias -----------------------------------------------------
+# Extrai métricas de confusionMatrix (com proteção quando cm é NULL)
+# utilitarias
+get_metrics <- function(cm_object, prop, sim_num, method_name, cutoff_used = NA_real_, auc_roc = NA_real_, auc_pr = NA_real_) {
+  if (is.null(cm_object)) {
+    return(tibble(
+      Proportion_Minority = prop,
+      Simulation_Number = sim_num,
+      Method = method_name,
+      Cutoff = cutoff_used,
+      Accuracy = NA_real_,
+      Kappa = NA_real_,
+      Sensitivity = NA_real_,
+      Specificity = NA_real_,
+      Pos_Pred_Value = NA_real_,
+      Neg_Pred_Value = NA_real_,
+      Balanced_Accuracy = NA_real_,
+      F1 = NA_real_,
+      AUC_ROC = NA_real_,  
+      AUC_PR = NA_real_,
+      Error = "model_or_cm_failed"
+    ))
+  }
+  
+  f1_val <- as.numeric(cm_object$byClass["F1"])
+  if (is.nan(f1_val)) f1_val <- 0 # Trata divisão por zero se Precisão/Sensibilidade forem 0
+  
+  tibble(
+    Proportion_Minority = prop,
+    Simulation_Number = sim_num,
+    Method = method_name,
+    Cutoff = cutoff_used,
+    Accuracy = as.numeric(cm_object$overall["Accuracy"]),
+    Kappa = as.numeric(cm_object$overall["Kappa"]),
+    Sensitivity = as.numeric(cm_object$byClass["Sensitivity"]),
+    Specificity = as.numeric(cm_object$byClass["Specificity"]),
+    Pos_Pred_Value = as.numeric(cm_object$byClass["Pos Pred Value"]),
+    Neg_Pred_Value = as.numeric(cm_object$byClass["Neg Pred Value"]),
+    Balanced_Accuracy = as.numeric(cm_object$byClass["Balanced Accuracy"]),
+    F1 = f1_val,
+    AUC_ROC = as.numeric(auc_roc),
+    AUC_PR = as.numeric(auc_pr),
+    Error = NA_character_
+  )
+}
+
+
+
+
+compute_cutoff <- function(y_true_factor, probs, fallback) {
+  # 1. Verificações de entrada
+  probs <- as.numeric(probs)
+  if (length(probs) != length(y_true_factor)) return(fallback)
+  
+  # 2. Garante que os níveis são 0 e 1 e lida com predições únicas
+  y_true_factor <- factor(y_true_factor, levels = c("0", "1"))
+  if (length(unique(probs)) == 1) return(fallback)
+  
+  # 3. Cálculo ROC
+  roc_obj <- tryCatch(pROC::roc(y_true_factor, probs, quiet = TRUE), error = function(e) NULL)
+  if (is.null(roc_obj)) return(fallback)
+  
+  # 4. Extração do Threshold Otimizado
+  th <- tryCatch(pROC::coords(roc_obj, "best", ret = "threshold", transpose = FALSE), 
+                 error = function(e) NULL)
+  
+  # 5. COERÇÃO ROBUSTA (Correção principal): 
+  # Usa unlist para lidar com listas/tibbles complexas e pega o primeiro valor
+  if (!is.null(th)) {
+    th_numeric <- as.numeric(unlist(th))[1]
+  } else {
+    th_numeric <- NA_real_
+  }
+  
+ # 6. Verificação de falha (Melhorado: captura NaNs e valores Infinitos)
+  if (is.na(th_numeric) || is.nan(th_numeric) || is.infinite(th_numeric) || length(th_numeric) < 1) {
+    return(fallback) 
+  }
+  
+  return(th_numeric)
+}
+
+safe_confusion <- function(y_true, y_pred) {
+  y_true <- as.character(y_true)
+  y_pred <- as.character(y_pred)
+  if (length(y_true) != length(y_pred)) return(NULL)
+  y_true_f <- factor(y_true, levels = c("0","1"))
+  y_pred_f <- factor(y_pred, levels = c("0","1"))
+  cm <- tryCatch(caret::confusionMatrix(y_pred_f, y_true_f, positive = "1"), error = function(e) NULL)
+  return(cm)
+}
+
+```
+
+
+
+
+
+
+
+```{r}
+# 3. Funções de log-verossimilhança para PL e RPL -----------------------------
+logvero.PL <- function(param, y, x, EPS_PROB) {
+  k <- ncol(x)
+  beta <- param[1:k]
+  lambda.star <- param[k+1]
+  lambda <- exp(lambda.star)
+  p <- powdist::pplogis(q = as.numeric(x %*% beta), mu = 0, sigma = 1, lambda = lambda)
+  p[p <= EPS_PROB] <- EPS_PROB
+  p[p >= 1 - EPS_PROB] <- 1 - EPS_PROB
+  sum(y * log(p) + (1-y)*log(1-p))
+}
+
+logvero.RPL <- function(param, y, x, EPS_PROB) {
+  k <- ncol(x)
+  beta <- param[1:k]
+  lambda.star <- param[k+1]
+  lambda <- exp(lambda.star)
+  p <- powdist::prplogis(q = as.numeric(x %*% beta), mu = 0, sigma = 1, lambda = lambda)
+  p[p <= EPS_PROB] <- EPS_PROB
+  p[p >= 1 - EPS_PROB] <- 1 - EPS_PROB
+  sum(y * log(p) + (1-y)*log(1-p))
+}
+
+```
+
+
+
+
+
+
+
+```{r}
+# 4. Gerador de dados robusto -------------------------------------------------
+gerar_df <- function(n, prop_one_minority, p_features = P_FEATURES) {
+  n_1 <- round(prop_one_minority * n)
+  n_0 <- n - n_1
+  X0 <- mvtnorm::rmvnorm(n_0, mean = rep(0, p_features), sigma = 4 * diag(p_features))
+  X1 <- mvtnorm::rmvnorm(n_1, mean = rep(1 / sqrt(p_features), p_features), sigma = diag(p_features))
+  df <- as_tibble(rbind(X0, X1))
+  colnames(df)[1:p_features] <- paste0("x", 1:p_features)
+  df$Class <- factor(c(rep(0, n_0), rep(1, n_1)), levels = c(0,1))
+  df$pesos <- ifelse(df$Class == 1, 1/prop_one_minority, 1/(1 - prop_one_minority))
+  return(df)
+}
+
+```
+
+
+
+
+
+
+
+```{r}
+# 5. Funções de ajuste dos modelos (robustas) ---------------------------------
+# Cada função tenta ajustar; se falhar, retorna linha NA via get_metrics
+
+
+fit_model_maxLik <- function(dados, prop, sim_num, function_vero, method_name = NULL, EPS_PROB) {
+  split <- rsample::initial_split(dados, prop = 0.75, strata = Class)
+  train <- rsample::training(split); test <- rsample::testing(split)
+  y_train <- as.numeric(as.character(train$Class))
+  x_train <- as.matrix(train %>% select(starts_with("x")))
+  x_test <- as.matrix(test %>% select(starts_with("x")))
+  start <- rep(0, ncol(x_train)+1); start[length(start)] <- log(1)
+  est <- tryCatch(maxLik(logLik = function_vero, start = start, y = y_train, x = x_train, EPS_PROB <- 1e-12,
+                         method = "BFGSR", control = list(iterlim = 1000)), error = function(e) NULL)
+  if (is.null(est) || any(is.na(est$estimate))) return(get_metrics(NULL, prop, sim_num, ifelse(is.null(method_name), deparse(substitute(function_vero)), method_name), cutoff_used, v_auc_roc, v_auc_pr))
+  beta <- est$estimate[1:(length(est$estimate)-1)]
+  lambda <- exp(est$estimate[length(est$estimate)])
+  p_pred <- tryCatch({
+    if (identical(function_vero, logvero.PL)) powdist::pplogis(q = as.numeric(x_test %*% beta), mu = 0, sigma = 1, lambda = lambda)
+    else if (identical(function_vero, logvero.RPL)) powdist::prplogis(q = as.numeric(x_test %*% beta), mu = 0, sigma = 1, lambda = lambda)
+    else 1 / (1 + exp(-(x_test %*% beta)))
+  }, error = function(e) rep(NA_real_, nrow(test)))
+  
+  test$Class <- factor(test$Class, levels = c("0", "1"))
+  
+  p_pred <- as.numeric(p_pred)
+  p_pred[is.na(p_pred)] <- EPS_PROB
+  p_pred[p_pred <= EPS_PROB] <- EPS_PROB
+  p_pred[p_pred >= 1 - EPS_PROB] <- 1 - EPS_PROB
+  
+   # Cálculo da AUC-ROC via pROC
+  roc_obj <- tryCatch(pROC::roc(test$Class, p_pred, quiet = TRUE), error = function(e) NULL)
+  v_auc_roc <- if(!is.null(roc_obj)) as.numeric(pROC::auc(roc_obj)) else NA_real_
+  
+  # Cálculo da AUC-PR via PRROC
+  # scores.class0 recebe as probabilidades da classe positiva (1) correspondente aos uns reais
+  # scores.class1 recebe as probabilidades da classe positiva (1) correspondente aos zeros reais
+  pr_obj <- tryCatch({
+    PRROC::pr.curve(scores.class0 = p_pred[test$Class == "1"], 
+                    scores.class1 = p_pred[test$Class == "0"], 
+                    curve = FALSE)
+  }, error = function(e) NULL)
+  v_auc_pr <- if(!is.null(pr_obj)) pr_obj$auc.integral else NA_real_
+  
+  cutoff <- compute_cutoff(test$Class, p_pred, fallback = prop)
+  if (length(p_pred) != nrow(test)) return(get_metrics(NULL, prop, sim_num, ifelse(is.null(method_name), deparse(substitute(function_vero)), method_name), cutoff, v_auc_roc, v_auc_pr))
+  pred <- ifelse(p_pred >= cutoff, "1", "0")
+  cm <- safe_confusion(test$Class, pred)
+  return(get_metrics(cm, prop, sim_num, ifelse(is.null(method_name), deparse(substitute(function_vero)), method_name), cutoff, v_auc_roc, v_auc_pr))
+}
+
+fit_model_glm_weighted <- function(dados, prop, sim_num, EPS_PROB) {
+  split <- rsample::initial_split(dados, prop = 0.75, strata = Class)
+  train <- rsample::training(split); test <- rsample::testing(split)
+  est_glm <- tryCatch(suppressWarnings(glm(Class ~ ., data = train %>% select(-pesos), family = binomial(link = "logit"), weights = train$pesos)), error = function(e) NULL)
+  if (is.null(est_glm)) return(get_metrics(NULL, prop, sim_num, "GLM_Weighted"))
+  p_pred <- tryCatch(as.numeric(predict(est_glm, newdata = test %>% select(-Class, -pesos), type = "response")), error = function(e) rep(NA_real_, nrow(test)))
+  p_pred[is.na(p_pred)] <- EPS_PROB
+  p_pred[p_pred <= EPS_PROB] <- EPS_PROB
+  p_pred[p_pred >= 1 - EPS_PROB] <- 1 - EPS_PROB
+  
+  roc_obj <- tryCatch(pROC::roc(test$Class, p_pred, quiet = TRUE), error = function(e) NULL)
+  v_auc_roc <- if(!is.null(roc_obj)) as.numeric(pROC::auc(roc_obj)) else NA_real_
+  
+  pr_obj <- tryCatch({
+    PRROC::pr.curve(scores.class0 = p_pred[test$Class == "1"], 
+                    scores.class1 = p_pred[test$Class == "0"], 
+                    curve = FALSE)
+  }, error = function(e) NULL)
+  v_auc_pr <- if(!is.null(pr_obj)) pr_obj$auc.integral else NA_real_
+  
+  cutoff <- compute_cutoff(test$Class, p_pred, fallback = prop)
+  pred <- ifelse(p_pred >= cutoff, "1", "0")
+  cm <- safe_confusion(test$Class, pred)
+  return(get_metrics(cm, prop, sim_num, "GLM_Weighted", cutoff, v_auc_roc, v_auc_pr))
+}
+
+fit_model_glm_standard <- function(dados, prop, sim_num, EPS_PROB) {
+  split <- rsample::initial_split(dados, prop = 0.75, strata = Class)
+  train <- rsample::training(split); test <- rsample::testing(split)
+  est_glm <- tryCatch(suppressWarnings(glm(Class ~ ., data = train %>% select(-pesos), family = binomial(link = "logit"))), error = function(e) NULL)
+  if (is.null(est_glm)) return(get_metrics(NULL, prop, sim_num, "GLM_Standard"))
+  p_pred <- tryCatch(as.numeric(predict(est_glm, newdata = test %>% select(-Class, -pesos), type = "response")), error = function(e) rep(NA_real_, nrow(test)))
+  p_pred[is.na(p_pred)] <- EPS_PROB
+  p_pred[p_pred <= EPS_PROB] <- EPS_PROB
+  p_pred[p_pred >= 1 - EPS_PROB] <- 1 - EPS_PROB
+  
+  roc_obj <- tryCatch(pROC::roc(test$Class, p_pred, quiet = TRUE), error = function(e) NULL)
+  v_auc_roc <- if(!is.null(roc_obj)) as.numeric(pROC::auc(roc_obj)) else NA_real_
+  
+  pr_obj <- tryCatch({
+    PRROC::pr.curve(scores.class0 = p_pred[test$Class == "1"], 
+                    scores.class1 = p_pred[test$Class == "0"], 
+                    curve = FALSE)
+  }, error = function(e) NULL)
+  v_auc_pr <- if(!is.null(pr_obj)) pr_obj$auc.integral else NA_real_
+  
+  
+  
+  cutoff <- compute_cutoff(test$Class, p_pred, fallback = prop)
+  pred <- ifelse(p_pred >= cutoff, "1", "0")
+  cm <- safe_confusion(test$Class, pred)
+  return(get_metrics(cm, prop, sim_num, "GLM_Standard", cutoff, v_auc_roc, v_auc_pr))
+}
+
+```
+
+
+
+
+
+
+
+```{r}
+# 6. Runner e função principal de simulação ----------------------------------
+CLASS_PROPORTIONS <- c(0.25, 0.10, 0.01)
+NUM_SIMULATIONS <- c(1000) # testar com 10 para começar
+results <- tibble()
+with_progress({
+  for (prop in CLASS_PROPORTIONS) {
+    for (sim_total in NUM_SIMULATIONS) {
+      
+      message(sprintf("\n>>> Executando: Prop = %.2f | Total de Sims = %d", prop, sim_total))
+      
+      # O local() resolve o erro de "finite life span"
+      out <- local({
+        # Agora o progressor está protegido dentro deste ambiente local
+        p <- progressor(steps = sim_total)
+        
+        future_map_dfr(1:sim_total, ~{
+          p() # Atualiza a barra
+          
+          dados <- gerar_df(n = N_DATA, prop_one_minority = prop)
+      
+          bind_rows(
+            fit_model_maxLik(dados, prop, .x, logvero.PL, method_name = "GLM_PL"),
+            fit_model_maxLik(dados, prop, .x, logvero.RPL, method_name = "GLM_RPL"),
+            fit_model_glm_weighted(dados, prop, .x),
+            fit_model_glm_standard(dados, prop, .x)
+          )
+        }, .options = furrr_options(seed = TRUE))
+      })
+      
+      results <- bind_rows(results, out)
+      
+      # Dica: Salvar parcial após cada combinação de Prop e Sim
+      # readr::write_csv(results, "results_parcial.csv")
+    }
+  }
+})
+
+results <- results %>% mutate(Method = as.character(Method))
+results
+
+readr::write_csv(results, "results.csv")
+
+```
+
+
+
+
+
+
+
+```{r}
+# 7. Agregação e visualização -----------------------------------------------
+metric_tab <- results
+
+metric_summary <- metric_tab %>%
+  group_by(Proportion_Minority, Method) %>%
+  summarise(
+    Acuracia = mean(Accuracy, na.rm = TRUE),
+    Acuracia_Balanceada = mean(Balanced_Accuracy, na.rm = TRUE),
+    Sensibilidade = mean(Sensitivity, na.rm = TRUE),
+    Especificidade = mean(Specificity, na.rm = TRUE),
+    AUC_ROC = mean(AUC_ROC, na.rm = TRUE),  
+    AUC_PR = mean(AUC_PR, na.rm = TRUE),
+    Cutoff_Medio = mean(Cutoff, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+metric_summary
+
+```
+
+
+
+
+
+
+
+```{r}
+
+# 8. Graficos ------------------------------------------------
+
+# metric_long <- metric_summary %>%
+#   pivot_longer(cols = c(Acuracia, Acuracia_Balanceada, Sensibilidade, Especificidade, AUC_ROC, AUC_PR),
+#                names_to = "Metrica", values_to = "Valor") %>%
+#   mutate(Prop_Label = factor(Proportion_Minority, levels = c(0.25,0.10,0.01),
+#                              labels = c("P = 25%","P = 10%","P = 1%")),
+#          Metrica = factor(Metrica, levels = c("Acuracia","Acuracia_Balanceada","Sensibilidade","Especificidade", "AUC_ROC", "AUC_PR")))
+# 
+# ggplot(metric_long, aes(x = Method, y = Valor, fill = Method)) +
+#   geom_col(show.legend = FALSE) +
+#   geom_text(aes(label = ifelse(is.na(Valor), "NA", scales::percent(Valor, accuracy = 0.1))),
+#             vjust = -0.3, size = 3) +
+#   facet_grid(Metrica ~ Prop_Label) +
+#   scale_y_continuous(limits = c(0,1), labels = scales::percent) +
+#   labs(title = "Comparação Média das Métricas por Proporção de Minoria",
+#        x = "Método", y = "Valor") +
+#   theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+# 
+# ggsave("comparacao_metricas.png", width = 11, height = 10, dpi = 300)
+# 
+# 
+# # 1. Transformar para formato longo incluindo todas as métricas calculadas
+# metric_long <- metric_summary %>%
+#   pivot_longer(cols = c(Acuracia, Acuracia_Balanceada, Sensibilidade, Especificidade, AUC_ROC, AUC_PR),
+#                names_to = "Metrica", values_to = "Valor") %>%
+#   mutate(Prop_Label = factor(Proportion_Minority, levels = c(0.25,0.10,0.01),
+#                              labels = c("P = 25%","P = 10%","P = 1%")),
+#          Metrica = factor(Metrica, levels = c("Acuracia","Acuracia_Balanceada","Sensibilidade","Especificidade", "AUC_ROC", "AUC_PR")))
+# 
+# # 2. Gerar o painel visual (Corrigido para evitar sobreposição)
+# ggplot(metric_long, aes(x = Method, y = Valor, fill = Method)) +
+#   geom_col(show.legend = FALSE, alpha = 0.8) +
+#   
+#   # 1. Rótulos: arredondamos e usamos 'vjust' para dar um respiro acima da barra
+#   geom_text(aes(label = ifelse(is.na(Valor), "NA", format(round(Valor, 4), nsmall = 4))),
+#             vjust = -0.5,  # Sobe um pouco mais o texto
+#             size = 2.5) +    # Ajuste o tamanho conforme necessário
+#   
+#   facet_grid(Metrica ~ Prop_Label) + 
+#   
+#   # 2. Expansão do eixo Y: O 'expand' garante que o topo não corte o texto
+#   scale_y_continuous(
+#     limits = c(0, 1.1),
+#     labels = function(x) format(round(x, 4), nsmall = 4),
+#     expand = expansion(mult = c(0, 0.15)) # Adiciona 15% de espaço no topo
+#   ) +
+#   
+#   labs(
+#     title = "Comparativo de Modelos por Proporção de Minoria",
+#     x = "Método", 
+#     y = "Valor Nominal"
+#   ) +
+#   theme_minimal() +
+#   theme(
+#     axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+#     strip.text = element_text(face = "bold", size = 10), 
+#     panel.spacing = unit(1, "lines")
+#   )
+# 
+# ggsave(
+#   filename = "comparativo_modelos_por_proporcao.png",
+#   plot = last_plot(), # Garante que está pegando o último gráfico gerado
+#   width = 11,         # Largura em polegadas
+#   height = 10,         # Altura em polegadas
+#   dpi = 300,          # Alta resolução para impressão ou relatórios
+#   bg = "white"        # Define fundo branco (evita fundos transparentes em alguns sistemas)
+# )
+
+# 8. Gráficos (Código unificado e otimizado) ----------------------------------
+metric_long <- metric_summary %>%
+  pivot_longer(cols = c(Acuracia, Acuracia_Balanceada, Sensibilidade, Especificidade, AUC_ROC, AUC_PR),
+               names_to = "Metrica", values_to = "Valor") %>%
+  mutate(Prop_Label = factor(Proportion_Minority, levels = c(0.25, 0.10, 0.01),
+                             labels = c("P = 25%","P = 10%","P = 1%")),
+         Metrica = factor(Metrica, levels = c("Acuracia","Acuracia_Balanceada","Sensibilidade","Especificidade", "AUC_ROC", "AUC_PR")))
+
+# Gerar o painel visual final corrigido
+ggplot(metric_long, aes(x = Method, y = Valor, fill = Method)) +
+  geom_col(show.legend = FALSE, alpha = 0.8) +
+  geom_text(aes(label = ifelse(is.na(Valor), "NA", format(round(Valor, 4), nsmall = 4))),
+            vjust = -0.5,  
+            size = 2.5) +    
+  facet_grid(Metrica ~ Prop_Label) + 
+  scale_y_continuous(
+    labels = function(x) format(round(x, 4), nsmall = 4),
+    expand = expansion(mult = c(0, 0.15)) 
+  ) +
+  labs(
+    title = "Comparativo de Modelos por Proporção de Minoria",
+    x = "Método", 
+    y = "Valor Nominal"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text = element_text(face = "bold", size = 10), 
+    panel.spacing = unit(1, "lines")
+  )
+
+ggsave(
+  filename = "comparativo_modelos_por_proporcao.png",
+  plot = last_plot(), 
+  width = 11,         
+  height = 10,         
+  dpi = 300,          
+  bg = "white"        
+)
+
+
+```
+
+
+
+
+
+
+
+```{r}
+# 9. Salvamento de resultados ------------------------------------------------
+readr::write_csv(metric_tab, "metric_tab_results.csv")
+message("Salvo em metric_tab_results.csv")
+
+```
+
