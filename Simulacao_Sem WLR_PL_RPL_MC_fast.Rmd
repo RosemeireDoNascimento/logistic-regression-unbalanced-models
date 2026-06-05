@@ -1,0 +1,642 @@
+---
+title: "Simulacao_Sem WLR_PL_RPL_MC_fast"
+author: "Rosemeire do Nascimento"
+date: "20/02/2026"
+output: pdf_document
+---
+
+
+```{r setup, include=FALSE}
+library(caret)
+library(tidymodels)
+library(recipes)
+library(mvtnorm)
+library(smotefamily)
+library(ROSE)
+library(glmnet)
+library(dplyr)
+library(tidyr)
+library(doFuture)
+library(future.apply)
+library(progressr)
+library(future)
+library(ggplot2)
+library(pROC)
+library(recipes)
+library(themis)
+library(data.table)
+library(readr)
+library(tidytext)
+library(furrr)
+library(purrr)
+library(rsample)
+
+```
+
+
+
+
+
+
+
+
+```{r}
+
+plan(multisession, workers = 14)
+options(future.globals.maxSize = 8 * 1024^3)
+registerDoFuture()
+
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+# 1. Parâmetros
+set.seed(1234)
+
+n        <- 10000
+p_list   <- c(0.25, 0.10, 0.01)
+n_rep    <- 1000
+target   <- "target"
+
+```
+
+
+
+
+
+
+
+
+```{r}
+# ───── 2. Parâmetros globais para geração de dados ────────────────────────
+  Sigma0 <- 4 * diag(20)
+  Sigma1 <- diag(20)
+
+  mu0 <- rep(0, 20)
+  mu1 <- rep(1 / sqrt(20), 20)
+
+  col_names <- paste0("x", 1:20)
+  
+# ───── 2. Gerar dados  ─────────────────────────────────────────────
+gerar_df <- function(n, class_prop) {
+  
+  n_0_full <- round((1 - class_prop) * n)
+  n_1_full <- (n - n_0_full)
+
+  Y.0 <- rep(0, n_0_full)
+  Y.1 <- rep(1, n_1_full)
+  
+  X.0 <- mvtnorm::rmvnorm(n_0_full, mean = mu0, sigma = Sigma0)
+  X.1 <- mvtnorm::rmvnorm(n_1_full, mean = mu1, sigma = Sigma1)
+
+  raw <- as.data.frame(rbind(X.0, X.1))
+  raw$target <- factor(c(Y.0, Y.1), levels = c(0, 1))
+  colnames(raw)[1:20] <- col_names
+
+  return(raw)
+}
+
+```
+
+
+
+
+
+
+
+```{r}
+# ───── 3. Função de Avaliação  ─────────────────────────────
+
+# Métricas (criadas apenas uma vez)
+metricas <- yardstick::metric_set(
+  roc_auc,
+  accuracy,
+  bal_accuracy,
+  yardstick::recall,
+  yardstick::spec,
+  yardstick::precision,
+  kap,
+  npv,
+  f_means,
+  event_level = "second"
+)
+
+# Grid para glmnet
+grid_spec <- dials::grid_regular(penalty(), levels = 3)
+
+# Controle do resampling
+ctrl <- control_resamples(
+  save_pred = FALSE,
+  verbose = FALSE,
+  allow_par = TRUE
+)
+
+config <- tidyr::crossing(
+  tipo_modelo = c("logistic","ridge","lasso"),
+  reamostragem = c(
+    "none","upsample","downsample","rose",
+    "smote","smote-tomek","adasyn","smote-enn"
+  )
+)
+
+config$nome <- paste(config$tipo_modelo,
+                     config$reamostragem,
+                     sep="_")
+
+
+
+# ───── Função para criar workflow ─────────────────────────────
+criar_workflow <- function(tipo_modelo, reamostragem, train){
+
+  if(tipo_modelo == "logistic"){
+
+    modelo_spec <- logistic_reg() |>
+      set_engine("glm")
+
+  } else {
+
+    mixture_val <- ifelse(tipo_modelo == "lasso", 1, 0)
+
+    modelo_spec <- logistic_reg(
+      penalty = tune(),
+      mixture = mixture_val
+    ) |>
+      set_engine("glmnet")
+
+  }
+
+  recipe_spec <- recipe(target ~ ., data = train) |>
+    recipes::step_normalize(recipes::all_numeric_predictors())
+
+  recipe_spec <- switch(
+    reamostragem,
+    "upsample"     = recipe_spec |> step_upsample(target),
+    "downsample"   = recipe_spec |> step_downsample(target),
+    "rose"         = recipe_spec |> step_rose(target),
+    "smote"        = recipe_spec |> step_smote(target),
+    "adasyn"       = recipe_spec |> step_adasyn(target),
+    "smote-tomek"  = recipe_spec |> step_smote(target) |> step_tomek(target),
+    "smote-enn"    = recipe_spec |> step_smote(target) |> step_nearmiss(target),
+    recipe_spec
+  )
+
+  workflow() |>
+    add_model(modelo_spec) |>
+    add_recipe(recipe_spec)
+}
+
+# ───── Função para avaliar modelo ─────────────────────────────
+
+avaliar_modelo_geral <- function(nome, tipo_modelo, wf, cv_folds){
+
+  if(tipo_modelo == "logistic"){
+
+    res <- fit_resamples(
+      wf,
+      resamples = cv_folds,
+      metrics = metricas,
+      control = ctrl
+    )
+
+    resultados <- collect_metrics(res)
+
+  } else {
+
+    tune_res <- tune_grid(
+      wf,
+      resamples = cv_folds,
+      grid = grid_spec,
+      metrics = metricas,
+      control = ctrl
+    )
+
+    best_params <- select_best(tune_res, metric = "roc_auc")
+
+    resultados <- tune_res |>
+      collect_metrics() |>
+      dplyr::filter(.config == best_params$.config)
+
+  }
+
+  resultados |>
+    dplyr::mutate(
+      nome = nome,
+      tipo_modelo = tipo_modelo,
+      reamostragem = sub("^[^_]+_", "", nome)
+    )
+}
+
+
+
+```
+
+
+
+
+
+
+```{r}
+
+# 4. Loop Monte Carlo
+
+block_size <- 50
+n_blocks <- ceiling(n_rep/block_size)
+
+time_start <- Sys.time()
+
+for(prop in p_list){
+
+  message(sprintf("\n🚀 Iniciando Proporção: %0.2f", prop))
+
+  file_name <- paste0("resultado_MC_prop_",prop,".csv")
+  append_file <- file.exists(file_name)
+
+  for(b in seq_len(n_blocks)){
+
+    start_i <- (b-1)*block_size + 1
+    end_i <- min(b*block_size,n_rep)
+    
+    # Log de progresso do Bloco 
+    cat(sprintf("\r\t-> Progresso: Bloco %d/%d (%0.1f%%) | Reps: %d-%d", b, n_blocks, (b/n_blocks)*100, start_i, end_i))
+
+    res_block <- future.apply::future_lapply(
+      seq.int(start_i,end_i),
+      function(i){
+      
+        train <- gerar_df(n,class_prop=prop)
+
+        cv_folds <- rsample::vfold_cv(
+          train,
+          v=5,
+          strata=target
+        )
+
+        res <- purrr::map_dfr(
+  seq_len(nrow(config)),
+  function(j){
+
+    wf <- criar_workflow(
+      tipo_modelo = config$tipo_modelo[j],
+      reamostragem = config$reamostragem[j],
+      train = train
+    )
+
+    avaliar_modelo_geral(
+      nome = config$nome[j],
+      tipo_modelo = config$tipo_modelo[j],
+      wf = wf,
+      cv_folds = cv_folds
+    )
+
+  }
+)
+
+        message("Simulação ", i, " concluída")
+        
+        res |>
+          dplyr::mutate(
+            sim_id=i,
+            prop=prop
+          )
+
+      },
+      future.seed=TRUE,
+      future.globals = c("n", "prop", "mu0", "Sigma0", "mu1", "Sigma1", "col_names", 
+        "gerar_df", "target", "config", "criar_workflow", "avaliar_modelo_geral",
+        "metricas", "ctrl", "grid_spec"),
+      future.packages = c("tidymodels", "themis", "dplyr", "purrr", "glmnet")
+    )
+
+    df_save <- data.table::rbindlist(res_block)
+
+    data.table::fwrite(
+      df_save,
+      file_name,
+      append=append_file,
+      col.names=!append_file
+    )
+
+    append_file <- TRUE
+
+    cat(sprintf("\r\t-> Processando Reps: %d-%d [%0.1f%%]", start_i, end_i, (end_i/n_rep)*100))
+    
+  }
+
+}
+
+time_end <- Sys.time()
+
+message("Tempo total: ",
+        round(difftime(time_end,time_start,units="hours"),2),
+        " horas")
+
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+# 5. Salvamento
+# ─────  Consolidação dos Resultados ─────────────────────────────
+
+# 5.1. Localizar todos os arquivos CSV criados pelo loop
+arquivos_gerados <- sort(list.files(pattern = "resultado_MC_prop_.*\\.csv", full.names = TRUE))
+
+# 5.2. Ler e empilhar todos os arquivos em um único data frame
+metrics_final <- data.table::rbindlist(
+  lapply(arquivos_gerados, data.table::fread),
+  use.names = TRUE,
+  fill = TRUE
+)
+
+# 5.3. Salvar o arquivo consolidado (opcional, já que você já tem os parciais)
+data.table::fwrite(metrics_final, "metricas_completas_MC.csv")
+
+message("✅ Objeto 'metrics_final' criado com sucesso!")
+
+```
+
+
+
+
+
+
+
+```{r}
+# ------------------------------------------------------------
+# 6. MÉTRICAS AGREGADAS (Resumo Monte Carlo)
+# ------------------------------------------------------------
+
+metrics_agregadas <- metrics_final |>
+  
+  # 6.1. Seleciona colunas necessárias e transforma de formato longo para largo
+  dplyr::select(prop, nome, sim_id, .metric, mean) |>
+  tidyr::pivot_wider(
+    names_from  = .metric,
+    values_from = mean
+  ) |>
+  
+  # 6.2. Renomeia métricas para nomes mais claros
+  dplyr::rename(
+    auc          = roc_auc,
+    accuracy     = accuracy,
+    bal_accuracy = bal_accuracy,
+    sensitivity  = recall,
+    specificity  = spec,
+    precision    = precision,
+    npv          = npv,
+    kappa        = kap,
+    f1           = f_meas
+  ) |>
+  
+  # 6.3. Consolida as repetições Monte Carlo
+  dplyr::group_by(prop, nome) |>
+  dplyr::summarise(
+    
+    n_rep = dplyr::n(),
+    
+    # 6.4 Médias globais
+    mean_auc         = mean(auc, na.rm = TRUE),
+    mean_accuracy    = mean(accuracy, na.rm = TRUE),
+    mean_bal_acc     = mean(bal_accuracy, na.rm = TRUE),
+    mean_sensitivity = mean(sensitivity, na.rm = TRUE),
+    mean_specificity = mean(specificity, na.rm = TRUE),
+    mean_precision   = mean(precision, na.rm = TRUE),
+    mean_npv         = mean(npv, na.rm = TRUE),
+    mean_kappa       = mean(kappa, na.rm = TRUE),
+    mean_f1          = mean(f1, na.rm = TRUE),
+
+    # 6.5 Desvios padrão
+    sd_auc      = sd(auc, na.rm = TRUE),
+    sd_f1       = sd(f1, na.rm = TRUE),
+    sd_accuracy = sd(accuracy, na.rm = TRUE),
+
+    # 6.6 Intervalo de confiança 95% para AUC
+    ci_lower_auc = mean_auc - 1.96 * sd_auc / sqrt(n_rep),
+    ci_upper_auc = mean_auc + 1.96 * sd_auc / sqrt(n_rep),
+
+    .groups = "drop"
+  )
+  
+```
+
+
+
+
+
+
+
+
+
+```{r}
+# ───── 7. Gráficos ─────────────────────────────────────────
+
+# 7.1 Dados para boxplot geral (AUC)
+metrics_plot <- metrics_final |>
+  dplyr::filter(.metric == "roc_auc") |>
+  dplyr::rename(auc = mean)
+
+ggplot(
+  metrics_plot,
+  aes(x = reorder(nome, auc, FUN = median), y = auc, fill = nome)
+) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  facet_wrap(~prop) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  ) +
+  labs(
+    title = "Distribuição do AUC por Método e Proporção",
+    subtitle = "Simulação de Monte Carlo",
+    x = "Método (Modelo + Sampler)",
+    y = "Área Sob a Curva (AUC)"
+  )
+
+
+
+# ───── 7.2 Identificar Top 5 métodos por proporção ─────
+
+top_metodos <- metrics_final |>
+  dplyr::filter(.metric == "roc_auc") |>
+  dplyr::group_by(prop, nome) |>
+  dplyr::summarise(
+    mediana_auc = median(mean, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::group_by(prop) |>
+  dplyr::slice_max(order_by = mediana_auc, n = 5) |>
+  dplyr::pull(nome) |>
+  unique()
+
+
+
+# ───── 7.3 Dados filtrados para gráfico Top 5 ─────
+
+metrics_top_plot <- metrics_final |>
+  dplyr::filter(.metric == "roc_auc", nome %in% top_metodos) |>
+  dplyr::rename(auc = mean)
+
+
+
+# ───── 7.4 Gráfico Top 5 ─────
+
+ggplot(
+  metrics_top_plot,
+  aes(
+    x = tidytext::reorder_within(nome, auc, prop, fun = median),
+    y = auc,
+    fill = tipo_modelo
+  )
+) +
+  geom_boxplot(outlier.alpha = 0.1, width = 0.6) +
+  tidytext::scale_x_reordered() +
+  facet_wrap(~prop, scales = "free_y") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Top 5 Melhores Métodos por Proporção (AUC)",
+    subtitle = "Ordenados pela mediana da simulação de Monte Carlo",
+    x = "Método (Modelo_Sampler)",
+    y = "Área Sob a Curva (AUC)",
+    fill = "Tipo de Modelo"
+  )
+
+
+
+# ───── 7.5 Tabela resumo dos Top 5 ─────
+
+ranking_final <- metrics_agregadas |>
+  dplyr::group_by(prop) |>
+  dplyr::slice_max(order_by = mean_auc, n = 5) |>
+  dplyr::select(
+    prop,
+    nome,
+    mean_auc,
+    ci_lower_auc,
+    ci_upper_auc
+  )
+
+print(ranking_final)
+
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+# ------------------------------------------------------------
+# 8. Ranking por AUC média
+# ------------------------------------------------------------
+
+ranking_auc <- metrics_agregadas |>
+  dplyr::group_by(prop) |>
+  dplyr::arrange(dplyr::desc(mean_auc), .by_group = TRUE) |>
+  dplyr::mutate(rank_auc = dplyr::row_number()) |>
+  dplyr::ungroup()
+```
+
+
+
+
+
+
+
+```{r}
+# ------------------------------------------------------------
+# 9. Salvamento dos resultados agregados
+# ------------------------------------------------------------
+
+data.table::fwrite(
+  metrics_agregadas,
+  "metricas_agregadas_MC_fast.csv"
+)
+
+data.table::fwrite(
+  ranking_auc,
+  "ranking_auc_MC_fast.csv"
+)
+```
+
+
+
+
+
+
+
+```{r}
+# ------------------------------------------------------------
+# Gráfico das Médias com Intervalo de Confiança
+# ------------------------------------------------------------
+
+ggplot(
+  metrics_agregadas,
+  aes(
+    x = tidytext::reorder_within(nome, mean_auc, prop),
+    y = mean_auc,
+    fill = prop
+  )
+) +
+  geom_point(size = 3, color = "steelblue") +
+  geom_errorbar(
+    aes(
+      ymin = ci_lower_auc,
+      ymax = ci_upper_auc
+    ),
+    width = 0.3
+  ) +
+  tidytext::scale_x_reordered() +
+  facet_wrap(~prop, scales = "free_y") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Ranking: AUC Média com IC 95%",
+    subtitle = "Ordenado por desempenho dentro de cada proporção",
+    x = "Método",
+    y = "Média do AUC"
+  )
+
+ggplot(
+  metrics_agregadas,
+  aes(
+    x = tidytext::reorder_within(nome, mean_auc, prop),
+    y = mean_auc
+  )
+) +
+  geom_point(color = "steelblue", size = 2) +
+  geom_errorbar(
+    aes(
+      ymin = ci_lower_auc,
+      ymax = ci_upper_auc
+    ),
+    width = 0.2
+  ) +
+  tidytext::scale_x_reordered() +
+  facet_wrap(~prop, scales = "free_y") +
+  coord_flip() +
+  theme_minimal()
+
+
+```
+

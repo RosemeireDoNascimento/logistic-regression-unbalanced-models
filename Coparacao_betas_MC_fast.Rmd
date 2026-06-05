@@ -1,0 +1,570 @@
+---
+title: "Coparacao_betas_MC_fast"
+author: "Rosemeire do Nascimento"
+date: "19/02/2026"
+output: pdf_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE)
+
+library(mvtnorm)
+library(smotefamily)
+library(ROSE)
+library(glmnet)
+library(caret)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(future.apply)
+library(progressr)
+library(future)
+library(ggplot2)
+library(ggridges)
+library(themis)
+library(recipes)
+
+handlers(global = TRUE)
+
+```
+
+
+
+
+
+
+
+
+
+```{r}
+# 1. Parâmetros
+set.seed(1234)
+
+n        <- 10000
+p_dims   <- 3             # aumentado para maior robustez
+p_list   <- c(0.25, 0.10, 0.01)
+n_rep    <- 1000           # ajuste conforme CPU
+
+coef_names <- c("(Intercept)", paste0("x", 1:p_dims))
+true_beta  <- c(-2, rep(0.6, p_dims))
+
+form_glm <- as.formula(paste("y ~", paste0("x",1:p_dims,collapse="+")))
+
+plan(multisession, workers = parallel::detectCores() - 1)
+
+```
+
+
+
+
+
+
+
+```{r}
+# ================================
+# FUNÇÕES
+# ================================
+
+compute_beta_metrics_tidy <- function(df, eps = 1e-6){
+
+  df %>%
+    group_by(prop, method, coef, true) %>%
+    summarise(
+      bias = mean(estimate, na.rm = TRUE) - true,
+      variance = var(estimate, na.rm = TRUE),
+      mse = mean((estimate - true)^2, na.rm = TRUE),
+      rmse = sqrt(mse),
+      bias_rel = ifelse(abs(true) > eps, bias / true, NA_real_),
+      rmse_rel = ifelse(abs(true) > eps, rmse / abs(true), NA_real_),
+      mare = ifelse(abs(true) > eps,
+                    mean(abs(estimate - true) / abs(true), na.rm = TRUE),
+                    NA_real_),
+      false_positive_rate = ifelse(abs(true) <= eps,
+                                   mean(abs(estimate) > eps, na.rm = TRUE),
+                                   NA_real_),
+      .groups = "drop"
+    )
+}
+
+
+
+aggregate_beta_metrics_tidy <- function(metrics_df){
+
+  metrics_df %>%
+    group_by(prop, method) %>%
+    summarise(
+      mean_bias = mean(bias, na.rm = TRUE),
+      mean_rmse = mean(rmse, na.rm = TRUE),
+      mean_rmse_rel = mean(rmse_rel, na.rm = TRUE),
+      mean_variance = mean(variance, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(prop, mean_rmse)
+}
+```
+
+
+
+
+
+```{r}
+# 2. Funções Auxiliares
+logistic <- function(x) 1/(1+exp(-x))
+
+safe_named <- function(vec){
+  out <- rep(NA_real_, length(coef_names))
+  names(out) <- coef_names
+  if(is.null(vec)) return(out)
+  out[names(vec)] <- as.numeric(vec)
+  out
+}
+
+safe_fit <- function(fun, data, ...){
+  if(is.null(data)) return(safe_named(NULL))
+  tryCatch(fun(data, ...), error=function(e) safe_named(NULL))
+}
+
+# ---------------- GLM ----------------
+fit_glm <- function(df){
+  safe_named(coef(glm(form_glm,data=df,family=binomial)))
+}
+
+fit_glm_weighted <- function(df){
+  safe_named(coef(glm(form_glm,data=df,family=binomial,weights=df$pesos)))
+}
+
+# ---------------- GLMNET ----------------
+fit_glmnet_fast <- function(df,alpha){
+  x <- as.matrix(df[,paste0("x",1:p_dims)])
+  y <- as.numeric(as.character(df$y))
+  cv <- try(cv.glmnet(x,y,alpha=alpha,family="binomial",nfolds=3),silent=TRUE)
+  if(inherits(cv,"try-error")) return(safe_named(NULL))
+  b <- as.numeric(coef(cv,s="lambda.1se"))
+  names(b) <- coef_names
+  safe_named(b)
+}
+
+# ---------------- PLR ----------------
+fit_power_logit <- function(df,gamma=2){
+  x <- as.matrix(cbind(1,df[,paste0("x",1:p_dims)]))
+  y <- as.numeric(as.character(df$y))
+  
+  nll <- function(beta){
+    eta <- x%*%beta
+    p <- (1/(1+exp(-eta)))^gamma
+    p <- pmin(pmax(p,1e-10),1-1e-10)
+    -sum(y*log(p)+(1-y)*log(1-p))
+  }
+  
+  fit <- try(optim(rep(0,ncol(x)),nll,method="BFGS",
+                   control=list(maxit=1000)),silent=TRUE)
+  
+  if(inherits(fit,"try-error")) return(safe_named(NULL))
+  names(fit$par) <- coef_names
+  safe_named(fit$par)
+}
+
+# ---------------- RPLR ----------------
+fit_reverse_power_logit <- function(df,gamma=2){
+  x <- as.matrix(cbind(1,df[,paste0("x",1:p_dims)]))
+  y <- as.numeric(as.character(df$y))
+  
+  nll <- function(beta){
+    eta <- x%*%beta
+    p <- (1/(1+exp(-eta)))^(1/gamma)
+    p <- pmin(pmax(p,1e-10),1-1e-10)
+    -sum(y*log(p)+(1-y)*log(1-p))
+  }
+  
+  fit <- try(optim(rep(0,ncol(x)),nll,method="BFGS",
+                   control=list(maxit=1000)),silent=TRUE)
+  
+  if(inherits(fit,"try-error")) return(safe_named(NULL))
+  names(fit$par) <- coef_names
+  safe_named(fit$par)
+}
+```
+
+---
+
+
+
+```{r}
+# 3. Técnicas de Reamostragem (Versão Unificada com Recipes)
+
+do_resample <- function(df, metodo) {
+  # Garante que y seja fator para o recipe
+  df$y <- factor(df$y, levels = c("0", "1"))
+  
+  # 1. Definição da Receita Base (Limpeza de dados críticos)
+  rec_spec <- recipe(y ~ ., data = df) %>%
+    step_zv(all_predictors())          # Remove vars constantes (evita NA no GLM)
+  
+  # 2. Adição do Passo de Reamostragem conforme o método
+  rec_spec <- switch(
+    metodo,
+    "upsample"    = rec_spec %>% step_upsample(y),
+    "downsample"  = rec_spec %>% step_downsample(y),
+    "rose"        = rec_spec %>% step_rose(y),
+    "smote"       = rec_spec %>% step_smote(y),
+    "adasyn"      = rec_spec %>% themis::step_adasyn(y, neighbors = 5),
+    "smote_tomek" = rec_spec |> step_smote(y) |> step_tomek(y),
+    "smote_nearmiss"   = rec_spec |> step_smote(y) |> step_nearmiss(y),
+    #"smote_nc"    = rec_spec %>% step_smotenc(y, neighbors = 5),
+    rec_spec # Caso padrão (nenhum)
+  )
+  
+  # 3. Execução segura
+  dat_final <- tryCatch(
+  prep(rec_spec, training = df) %>% juice(),
+  error = function(e) NULL
+)
+
+return(dat_final)
+}
+
+```
+
+
+
+
+
+
+```{r}
+# 4. Loop Monte Carlo (Versão Otimizada)
+time_start <- Sys.time()
+all_results <- list()
+
+
+with_progress({
+
+    prog <- progressor(steps = length(p_list) * n_rep)
+
+  
+    
+for(prop in p_list){
+
+  message(">>> Proporção: ", prop)
+  t_prop_ini <- Sys.time()
+
+    res_prop <- future_lapply(seq_len(n_rep), function(i){
+
+      prog()
+
+      # Geração dos dados
+      n1 <- round(prop * n)
+      n0 <- n - n1
+      X0 <- rmvnorm(n0, rep(0, p_dims), 4*diag(p_dims))
+      X1 <- rmvnorm(n1, rep(1/sqrt(p_dims), p_dims), diag(p_dims))
+      X  <- rbind(X0, X1)
+      colnames(X) <- paste0("x", 1:p_dims)
+      
+      eta <- cbind(1, X) %*% true_beta
+      p   <- logistic(eta)
+      y   <- rbinom(n, 1, p)
+      df  <- data.frame(X, y = factor(y, levels = c(0, 1)))
+
+      # Cálculo de Pesos (Correção para weighted_glm)
+      # Cálculo de Pesos (Versão Estável)
+      tab <- table(df$y)
+      n0  <- as.numeric(tab["0"])
+      n1  <- as.numeric(tab["1"])
+      n_total <- n0 + n1
+
+      # Calculamos o peso unitário para cada classe
+      # Se a classe 1 for rara, ela ganha um peso maior (proporcional a n0)
+      w0 <- n1 / n_total
+      w1 <- n0 / n_total
+
+      # Atribuição correta: o ifelse vai aplicar o peso certo em cada linha
+      df$pesos <- ifelse(df$y == "1", w1, w0)
+
+
+      # Técnicas de Reamostragem (Usando a nova função do_resample)
+      tr_up    <- do_resample(df, "upsample")
+      tr_down  <- do_resample(df, "downsample")
+      tr_rose  <- do_resample(df, "rose")
+      tr_smote <- do_resample(df, "smote")
+      tr_adas  <- do_resample(df, "adasyn")
+      tr_sm_t  <- do_resample(df, "smote_tomek")
+      tr_sm_n  <- do_resample(df, "smote_nearmiss")
+      #tr_sm_nc <- do_resample(df, "smote_nc")
+
+      # Ajuste dos Modelos
+      rbind(
+        none            = fit_glm(df),
+        weighted_glm    = fit_glm_weighted(df, df$pesos),
+        ridge           = fit_glmnet_fast(df, 0),
+        lasso           = fit_glmnet_fast(df, 1),
+        PLR             = fit_power_logit(df),
+        RPLR            = fit_reverse_power_logit(df),
+        
+        up_glm          = safe_fit(fit_glm, tr_up),
+        down_glm        = safe_fit(fit_glm, tr_down),
+        rose_glm        = safe_fit(fit_glm, tr_rose),
+        smote_glm       = safe_fit(fit_glm, tr_smote),
+        adas_glm        = safe_fit(fit_glm, tr_adas),
+        smote_tomek_glm = safe_fit(fit_glm, tr_sm_t),
+        smote_nearmiss_glm   = safe_fit(fit_glm, tr_sm_n)
+        #smote_nc_glm    = fit_glm(tr_sm_nc)
+      )
+
+    }, future.seed = TRUE,
+       future.packages = c("recipes", "themis", "caret", "ROSE", "smotefamily", "glmnet", "mvtnorm", "dplyr"),
+       future.globals = TRUE 
+    )
+
+
+
+  all_results[[as.character(prop)]] <- res_prop
+  message("Tempo proporção ", prop, ": ", Sys.time() - t_prop_ini)
+  }
+})
+
+message("Tempo total: ", Sys.time() - time_start)
+
+
+```
+
+
+
+
+```{r}
+# 5. Consolidação e Métricas
+
+all_coefs <- bind_rows(
+  lapply(names(all_results), function(prop){
+
+    mats <- all_results[[prop]]
+
+    
+  bind_rows(lapply(seq_along(mats), function(i){
+
+    as.data.frame(mats[[i]]) %>%
+      rownames_to_column("method") %>%
+      pivot_longer(-method,names_to="coef",values_to="estimate") %>%
+      mutate(rep=i,prop=as.numeric(prop))
+  }))
+})
+)
+
+true_tbl <- data.frame(coef=coef_names,true=true_beta)
+all_coefs <- left_join(all_coefs,true_tbl,by="coef")
+
+metrics_coef <- all_coefs %>%
+  group_by(prop,method,coef,true) %>%
+  summarise(
+    rmse = sqrt(mean((estimate-true)^2,na.rm=TRUE)),
+    rmse_rel = ifelse(abs(true)>1e-6,rmse/abs(true),NA_real_),
+    .groups="drop"
+  )
+
+# Resumo final ordenado pelo melhor RMSE (menor erro)
+summary_final <- metrics_coef %>%
+  group_by(prop, method) %>%
+  summarise(mean_rmse = mean(rmse, na.rm = TRUE), .groups = "drop") %>%
+  arrange(prop, mean_rmse)
+
+print(summary_final)
+
+```
+
+
+
+
+
+```{r}
+# 6. Gráficos (30 Métodos)
+
+### RMSE Relativo
+ggplot(
+  metrics_coef %>% filter(abs(true)>0),
+  aes(x=reorder(method,rmse_rel),y=rmse_rel)
+)+
+  geom_col()+
+  facet_wrap(~prop,scales="free_y")+
+  coord_flip()+
+  theme_minimal()+
+  labs(title="RMSE Relativo – 30 Métodos",
+       x="Método",
+       y="RMSE Relativo")
+
+ggsave("rmse_relativo.png", width = 10, height = 8, dpi = 300)
+
+```
+
+
+
+
+
+```{r}
+### Densidade
+ggplot(
+  all_coefs,
+  aes(x=estimate,color=method)
+)+
+  geom_density(alpha=0.2)+
+  facet_grid(prop~coef,scales="free")+
+  theme_minimal()
+
+ggsave("densidade.png", width = 10, height = 8, dpi = 300)
+
+```
+
+
+
+
+
+```{r}
+### Ridge Plot
+ggplot(
+  all_coefs,
+  aes(x=estimate,y=method,fill=method)
+)+
+  geom_density_ridges(alpha=0.6)+
+  facet_grid(prop~coef,scales="free_x")+
+  theme_minimal()+
+  theme(legend.position="none")
+
+ggsave("ridge_plot.png", width = 10, height = 8, dpi = 300)
+
+```
+
+
+
+
+
+```{r}
+### Violin
+ggplot(
+  all_coefs,
+  aes(x=method,y=estimate,fill=method)
+)+
+  geom_violin(trim=FALSE,alpha=0.6)+
+  facet_grid(prop~coef,scales="free_y")+
+  theme_minimal()+
+  theme(axis.text.x=element_text(angle=90,hjust=1),
+        legend.position="none")
+
+ggsave("violin.png", width = 10, height = 8, dpi = 300)
+
+```
+
+
+
+
+
+
+
+
+
+```{r}
+# ============================================================
+# MÉTRICAS
+# ============================================================
+
+metrics_coef <- compute_beta_metrics_tidy(all_coefs)
+
+metrics_summary <- aggregate_beta_metrics_tidy(metrics_coef)
+
+```
+
+
+
+
+
+
+```{r}
+# ============================================================
+# SALVAMENTO AUTOMÁTICO (ROBUSTO)
+# ============================================================
+# ─────────────────────────────────────────────
+# Criar pasta de resultados
+# ─────────────────────────────────────────────
+
+dir.create("results", showWarnings = FALSE)
+
+# Criar timestamp automático
+timestamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
+
+# ─────────────────────────────────────────────
+# 1) Estimativas Monte Carlo completas
+# ─────────────────────────────────────────────
+
+write.csv(
+  all_coefs,
+  paste0("results/all_coefs_", timestamp, ".csv"),
+  row.names = FALSE
+)
+
+# Versão fixa (sempre sobrescreve)
+write.csv(
+  all_coefs,
+  "results/all_coefs_latest.csv",
+  row.names = FALSE
+)
+
+# ─────────────────────────────────────────────
+# 2) Métricas por coeficiente
+# ─────────────────────────────────────────────
+
+write.csv(
+  metrics_coef,
+  paste0("results/beta_metrics_coef_", timestamp, ".csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  metrics_coef,
+  "results/beta_metrics_coef_latest.csv",
+  row.names = FALSE
+)
+
+# ─────────────────────────────────────────────
+# 3) Métricas agregadas por método
+# ─────────────────────────────────────────────
+
+write.csv(
+  metrics_summary,
+  paste0("results/beta_metrics_summary_", timestamp, ".csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  metrics_summary,
+  "results/beta_metrics_summary_latest.csv",
+  row.names = FALSE
+)
+
+cat("\n==============================================\n")
+cat("Arquivos salvos com sucesso em /results\n")
+cat("Timestamp:", timestamp, "\n")
+cat("==============================================\n")
+
+```
+
+
+
+
+
+
+```{r}
+# ============================================================
+# GRÁFICOS
+# ============================================================
+ggplot(
+  metrics_coef %>% filter(abs(true) > 0),
+  aes(x = coef, y = rmse_rel, fill = method)
+) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ prop) +
+  theme_minimal() +
+  labs(title = "RMSE relativo por coeficiente")
+
+
+ggsave("rmse_relativo_por_coeficiente.png", width = 10, height = 8, dpi = 300)
+
+```
+
+

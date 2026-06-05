@@ -1,0 +1,440 @@
+---
+title: "Simulacao_Sem_WLR_PL_RPL_fast_Santander"
+author: "Rosemeire do Nascimento Santos"
+date: "2026-03-09"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+
+```{r}
+library(tidymodels)
+library(smotefamily)
+library(ROSE)
+library(glmnet)
+library(caret)
+library(dplyr)
+library(tidyr)
+library(future.apply)
+library(progressr)
+library(future)
+library(ggplot2)
+library(pROC)
+library(recipes)
+library(themis)
+library(tidytext)
+library(yardstick)
+library(data.table)
+
+```
+
+
+
+
+
+
+
+```{r}
+# 1. Parâmetros e Carregamento ------------------------------------------------
+set.seed(1234)
+
+# Leitura rápida com fread
+dados_raw <- fread("train.csv") 
+
+# Limpeza inicial: Remover ID e renomear target
+dados_raw[, ID_code := NULL]
+setnames(dados_raw, "target", "Class")
+dados_raw$Class <- factor(dados_raw$Class, levels = c("0", "1"))
+
+# --- ATENÇÃO: AMOSTRAGEM PARA VIABILIDADE ---
+# O dataset original é muito grande para SMOTE/ADASYN em tempo real.
+# Vamos usar uma amostra estratificada de 10% para a simulação.
+dados <- dados_raw %>%
+  group_by(Class) %>%
+  slice_sample(prop = 0.10) %>%
+  ungroup()
+
+N_DATA    <- nrow(dados)
+prop_real <- mean(dados$Class == "1")
+
+# Análise Básica
+cat("Dimensões da amostra:", dim(dados), "\n")
+print(table(dados$Class))
+
+# Definir o vetor de nomes das colunas preditoras
+# No Santander, todas começam com "var_"
+predictors <- grep("var_", names(dados), value = TRUE)
+
+# Correlação das primeiras 10 variáveis (apenas para exemplo)
+# Usando with = FALSE se 'dados' for data.table
+cor_mat <- cor(dados[, predictors[1:10], with = FALSE])
+
+print(round(cor_mat, 2))
+
+print(cor_mat)
+```
+
+
+
+
+
+
+
+```{r}
+# ───── 2. Função de Avaliação  ─────────────────────────────
+
+avaliar_modelo_geral <- function(nome, tipo_modelo, reamostragem, cv_folds, data) {
+
+  if (tipo_modelo == "logistic") {
+    modelo_spec <- logistic_reg() |> set_engine("glm")
+  } else {
+    mixture_val <- if (tipo_modelo == "lasso") 1 else 0
+    modelo_spec <- logistic_reg(penalty = tune(), mixture = mixture_val) |>
+      set_engine("glmnet")
+  }
+
+  recipe_spec <- recipe(Class ~ ., data = data) |>
+    step_normalize(all_numeric_predictors())
+
+  irecipe_spec <- switch(
+    reamostragem,
+    "none"        = recipe_spec, 
+    "upsample"    = recipe_spec |> step_upsample(Class),
+    "downsample"  = recipe_spec |> step_downsample(Class),
+    "rose"        = recipe_spec |> step_rose(Class),
+    "smote"       = recipe_spec |> step_smote(Class, neighbors = 5),
+    "adasyn"      = recipe_spec |> step_adasyn(Class, neighbors = 5),
+    "smote-tomek" = recipe_spec |> step_smote(Class) |> step_tomek(Class),
+    "smote-enn"   = recipe_spec |> step_smote(Class) |> step_nearmiss(Class),
+    recipe_spec # Fallback caso o nome não bata
+  )
+
+  wf <- workflow() |> add_model(modelo_spec) |> add_recipe(recipe_spec)
+
+  metricas <- yardstick::metric_set(
+  roc_auc,
+  pr_auc,
+  accuracy,
+  bal_accuracy,
+  yardstick::recall,
+  yardstick::precision,
+  kap
+)
+
+  ctrl <- control_resamples(save_pred = FALSE, verbose = FALSE, allow_par = FALSE)
+
+  if (tipo_modelo == "logistic") {
+
+    res <- fit_resamples(wf,
+                         resamples = cv_folds,
+                         metrics = metricas,
+                         control = ctrl)
+
+    resultados <- collect_metrics(res)
+
+  } else {
+
+    grid_spec <- grid_regular(penalty(range = c(-4, -1)), levels = 10)
+
+    tune_res <- tune_grid(
+      wf,
+      resamples = cv_folds,
+      grid = grid_spec,
+      metrics = metricas,
+      control = ctrl
+    )
+
+    best_params <- select_best(tune_res, metric = "roc_auc")
+
+    resultados <- tune_res |>
+      collect_metrics() |>
+      filter(.config == best_params$.config)
+  }
+
+  return(resultados |>
+           mutate(nome = nome,
+                  tipo_modelo = tipo_modelo,
+                  reamostragem = reamostragem))
+}
+
+```
+
+
+
+
+
+
+
+```{r}
+# plan(multisession, workers = 4)
+# progressr::handlers(global = TRUE)
+# handlers("txtprogressbar")
+```
+
+
+
+
+
+
+
+```{r}
+# ------------------------------------------------------------
+# 3. Execução única (sem Monte Carlo)
+# ------------------------------------------------------------
+
+time_start <- Sys.time()
+
+config <- tidyr::crossing(
+  tipo_modelo = c("logistic", "ridge", "lasso"),
+  reamostragem = c(
+    "none", "upsample", "downsample", "rose",
+    "smote", "smote-tomek", "adasyn",
+    "smote-enn"
+  )
+)
+
+# Cross-validation única
+cv_folds <- vfold_cv(dados, v = 5, strata = Class)
+
+with_progress({
+
+  p <- progressor(along = 1:nrow(config))
+
+  metrics_final <- purrr::pmap_dfr(
+    config,
+    function(tipo_modelo, reamostragem) {
+
+      p(sprintf("%s + %s", tipo_modelo, reamostragem))
+
+      avaliar_modelo_geral(
+        paste(tipo_modelo, reamostragem, sep = "_"),
+        tipo_modelo,
+        reamostragem,
+        cv_folds = cv_folds,
+        data = dados
+      )
+    }
+  )
+
+})
+
+time_end <- Sys.time()
+print(time_end - time_start)
+
+```
+
+
+
+
+
+
+
+```{r}
+# 4. Salvamento
+write.csv(metrics_final,
+          "metricas_predicao_santander.csv",
+          row.names=FALSE)
+```
+
+
+
+
+
+
+
+```{r}
+# ------------------------------------------------------------
+# 5. MÉTRICAS AGREGADAS
+# ------------------------------------------------------------
+
+metrics_agregadas <- metrics_final %>%
+  # Seleciona as colunas essenciais vindas do collect_metrics()
+  select(tipo_modelo, reamostragem, .metric, mean) %>%
+  # Transpõe para que cada métrica seja uma coluna
+  pivot_wider(names_from = .metric, values_from = mean) %>%
+  group_by(tipo_modelo, reamostragem) %>%
+  summarise(
+    # n_rep aqui contará quantos modelos foram consolidados (geralmente 1 por combinação)
+    n_rep = n(),
+
+    # Médias das métricas (usando os nomes padrão do yardstick)
+    mean_accuracy     = mean(accuracy, na.rm = TRUE),
+    mean_bal_accuracy = mean(bal_accuracy, na.rm = TRUE),
+    mean_recall       = mean(recall, na.rm = TRUE),
+    mean_precision    = mean(precision, na.rm = TRUE),
+    mean_auc          = mean(roc_auc, na.rm = TRUE), # yardstick usa roc_auc
+    mean_pr_auc       = mean(pr_auc, na.rm = TRUE),
+    mean_kappa        = mean(kap, na.rm = TRUE),
+
+    # Nota: Desvios padrão e IC só fazem sentido se houver repetições (n_rep > 1).
+    # Se for execução única, esses valores serão NA.
+    sd_auc            = sd(roc_auc, na.rm = TRUE),
+    
+    # Intervalo de confiança (apenas se n_rep > 1)
+    ci_lower_auc = if(n_rep > 1) mean_auc - 1.96 * sd_auc / sqrt(n_rep) else NA_real_,
+    ci_upper_auc = if(n_rep > 1) mean_auc + 1.96 * sd_auc / sqrt(n_rep) else NA_real_,
+
+    .groups = "drop"
+  )
+
+# Visualização rápida do Top 5 por AUC para conferência
+print("--- Melhores combinações (Top 5 por AUC) ---")
+metrics_agregadas %>% 
+  arrange(desc(mean_auc)) %>% 
+  head(5) %>% 
+  print()
+```
+
+
+
+
+
+
+
+```{r}
+# 6. Gráficos
+ggplot(metrics_agregadas,
+       aes(x = reorder(reamostragem, mean_auc),
+           y = mean_auc)) +
+  geom_col(fill = "steelblue") +
+  facet_wrap(~tipo_modelo, scales = "free_y") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    x = "Técnica de reamostragem",
+    y = "AUC",
+    title = "AUC por técnica de reamostragem Santander"
+  )
+
+# 2. Gráfico de Trade-off: AUC vs Acurácia Balanceada
+# Este gráfico é excelente para a tese, pois mostra se a reamostragem 
+# está melhorando a classificação sem destruir a acurácia global.
+ggplot(metrics_agregadas, 
+       aes(x = mean_bal_accuracy, y = mean_auc, color = reamostragem)) +
+  geom_point(size = 4, alpha = 0.7) +
+  facet_wrap(~tipo_modelo) +
+  geom_text(aes(label = reamostragem), vjust = -1, size = 2.5) +
+  theme_light() +
+  labs(
+    title = "Relação AUC vs. Acurácia Balanceada: Santander",
+    x = "Acurácia Balanceada",
+    y = "AUC (ROC)",
+    color = "Técnica"
+  )
+
+```
+
+
+
+
+
+
+
+```{r}
+# ------------------------------------------------------------
+# 7. Ranking por AUC média
+# ------------------------------------------------------------
+
+# Ranking Global: Compara todas as combinações
+ranking_auc_global <- metrics_agregadas %>%
+  arrange(desc(mean_auc)) %>%
+  mutate(rank_auc = row_number(),
+         mean_auc = round(mean_auc, 4),
+         mean_bal_accuracy = round(mean_bal_accuracy, 4)
+  ) %>%
+  select(rank_auc, tipo_modelo, reamostragem, mean_auc, mean_bal_accuracy)
+  
+# Ranking por Modelo: Identifica a melhor técnica para cada algoritmo separadamente
+ranking_auc_por_modelo <- metrics_agregadas %>%
+  group_by(tipo_modelo) %>%
+  arrange(desc(mean_auc), .by_group = TRUE) %>%
+  mutate(
+    rank_auc = row_number(),
+    mean_auc = round(mean_auc, 4)
+  ) %>%
+  ungroup() %>%
+  select(tipo_modelo, rank_auc, reamostragem, mean_auc)
+
+# Exibição no Console para conferência imediata
+cat("\n🏆 TOP 5 COMBINAÇÕES GLOBAIS (SANTANDER):\n")
+print(head(ranking_auc_global, 5))
+
+cat("\n🥇 MELHOR TÉCNICA POR TIPO DE MODELO:\n")
+print(ranking_auc_por_modelo %>% filter(rank_auc == 1))
+
+```
+
+
+
+
+
+
+
+```{r}
+# ------------------------------------------------------------
+# 8. Salvamento
+# ------------------------------------------------------------
+
+write.csv(metrics_agregadas,
+          "metricas_agregadas_santander.csv",
+          row.names = FALSE)
+
+write.csv(ranking_auc_global,
+          "ranking_auc_global_santander.csv",
+          row.names = FALSE)
+
+write.csv(ranking_auc_por_modelo,
+          "ranking_auc_por_modelo_santander.csv",
+          row.names = FALSE)
+```
+
+
+
+
+
+
+
+```{r}
+# ------------------------------------------------------------
+# 9. Gráfico das Médias de AUC
+# ------------------------------------------------------------
+
+ggplot(metrics_agregadas,
+       aes(x = reorder(reamostragem, mean_auc),
+           y = mean_auc)) +
+  geom_col(fill = "steelblue") +
+  facet_wrap(~tipo_modelo, scales = "free_y") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Comparar AUC média por técnica de reamostragem: Santander",
+    x = "Técnica de Reamostragem",
+    y = "AUC Média"
+  )
+
+ggplot(metrics_agregadas,
+       aes(x = reorder_within(reamostragem, mean_auc, tipo_modelo),
+           y = mean_auc)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = round(mean_auc, 3)), 
+            hjust = -0.2, size = 3) +
+  facet_wrap(~tipo_modelo, scales = "free_y") +
+  coord_flip() +
+  scale_x_reordered() +
+  theme_minimal() +
+labs(
+    title = "Ranking AUC média por técnica de reamostragem: Santander",
+    x = "Técnica de Reamostragem",
+    y = "AUC Média"
+  )
+
+```
+
+
+
+
+
+
+
+

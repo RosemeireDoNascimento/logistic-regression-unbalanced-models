@@ -1,0 +1,417 @@
+---
+title: "Simulacao_Sem_WLR_PL_RPL_CV_Creditcard"
+author: "Rosemeire do Nascimento Santos"
+date: "2026-02-25"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+
+```{r setup, include=FALSE}
+library(tidymodels)
+library(smotefamily)
+library(ROSE)
+library(glmnet)
+library(caret)
+library(dplyr)
+library(tidyr)
+library(future.apply)
+library(progressr)
+library(future)
+library(ggplot2)
+library(pROC)
+library(recipes)
+library(themis)
+library(tidytext)
+library(yardstick)
+
+```
+
+
+
+
+
+
+```{r}
+# Configurações de Memória e Paralelismo
+options(future.globals.maxSize = 8 * 1024^3) # Aumentado para 8GB
+plan(multicore, workers = parallel::detectCores() - 1)
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+# 1. Parâmetros
+set.seed(1234)
+
+dados <- read.csv("creditcard.csv")
+
+dados$Class  <- factor(dados$Class, levels = c(0,1))
+dados$Amount <- scale(dados$Amount)
+dados$Time   <- scale(dados$Time)
+
+target <- "Class"
+
+#Análise da Variável Resposta (Desbalanceamento)
+dados$Class <- factor(dados$Class, levels = c(0,1))
+table(dados$Class)
+prop.table(table(dados$Class))
+
+
+#Distribuição do Valor das Transações
+summary(dados$Amount)
+hist(dados$Amount, breaks = 100)
+boxplot(dados$Amount ~ dados$Class)
+
+dados$logAmount <- log1p(dados$Amount)
+
+#Correlação entre Variáveis
+cor_mat <- cor(dados[,1:28])
+
+#Comparação de Médias entre Classes
+aggregate(. ~ Class, data = dados[, c(2:30, 31)], mean)
+#Teste individual:
+t.test(V1 ~ Class, data = dados)
+
+#Métricas de Separação Inicial
+roc_obj <- roc(dados$Class, dados$V1)
+auc(roc_obj)
+
+```
+
+
+
+
+
+
+
+```{r}
+# ───── 2. Função de Avaliação Otimizada ─────────────────────────────
+
+avaliar_modelo_geral <- function(nome, tipo_modelo, reamostragem, cv_folds, data) {
+  
+  # 1. Especificação do Modelo
+  if (tipo_modelo == "logistic") {
+    modelo_spec <- logistic_reg() |> set_engine("glm")
+  } else {
+    mixture_val <- if (tipo_modelo == "lasso") 1 else 0
+    modelo_spec <- logistic_reg(penalty = tune(), mixture = mixture_val) |>
+      set_engine("glmnet")
+  }
+
+  # 2. Receita com Tratamento de Reamostragem
+  recipe_spec <- recipe(Class ~ ., data = data) |>
+    step_zv(all_predictors()) |> # <--- CRÍTICO: Evita falha do glmnet (REMOVE VARIÁVEIS COM VARIÂNCIA ZERO)
+    step_normalize(all_numeric_predictors())
+
+  recipe_spec <- switch(
+    reamostragem,
+    "upsample"    = recipe_spec |> step_upsample(Class),
+    "downsample"  = recipe_spec |> step_downsample(Class),
+    "rose"        = recipe_spec |> step_rose(Class),
+    "smote"       = recipe_spec |> step_smote(Class),
+    "adasyn"      = recipe_spec |> themis::step_adasyn(Class, neighbors = 10),
+    "smote-tomek" = recipe_spec |> step_smote(Class) |> step_tomek(Class),
+    "smote-enn"   = recipe_spec |> step_smote(Class) |> step_nearmiss(Class),
+    "smote-nc"    = recipe_spec |> step_smotenc(Class, neighbors = 5),
+    recipe_spec # Caso "none"
+  )
+
+  # 3. Workflow e Métricas
+  wf <- workflow() |> add_model(modelo_spec) |> add_recipe(recipe_spec)
+
+  metricas <- yardstick::metric_set(
+    roc_auc, pr_auc, accuracy, bal_accuracy, 
+    yardstick::recall, yardstick::precision, kap
+  )
+
+  # allow_par = TRUE para usar os cores do Linux no processamento dos folds
+  ctrl <- control_resamples(save_pred = FALSE, verbose = FALSE, allow_par = FALSE, event_level = "second")
+
+  # 4. Execução com tryCatch (Segurança)
+  resultados <- tryCatch({
+    if (tipo_modelo == "logistic") {
+      res <- fit_resamples(wf, resamples = cv_folds, metrics = metricas, control = ctrl)
+      collect_metrics(res)
+    } else {
+      # Tuning para Ridge/Lasso
+      grid_spec <- grid_regular(penalty(), levels = 10)
+      tune_res <- tune_grid(wf, resamples = cv_folds, grid = grid_spec, 
+                            metrics = metricas, control = ctrl)
+      
+      best_params <- select_best(tune_res, metric = "roc_auc")
+      tune_res |> collect_metrics() |> filter(.config == best_params$.config)
+    }
+  }, error = function(e) {
+    message(paste("Erro no modelo:", nome, "-", e$message))
+    return(NULL) # Retorna NULL se o SMOTE/Modelo falhar
+  })
+
+  # 5. Retorno formatado
+  if (is.null(resultados)) return(NULL)
+  
+  return(resultados |>
+           mutate(nome = nome,
+                  tipo_modelo = tipo_modelo,
+                  reamostragem = reamostragem))
+}
+
+```
+
+
+
+
+
+
+
+```{r}
+# 3. Execução Única (Substitui o Loop de Monte Carlo)
+
+time_start <- Sys.time()
+
+# 3.1. Definição do Cross-Validation 
+cv_folds <- vfold_cv(dados, v = 5, strata = Class)
+
+# 3.2. Grade de Configurações
+config <- tidyr::crossing(
+  tipo_modelo = c("logistic", "ridge", "lasso"),
+  reamostragem = c(
+    "none", "upsample", "downsample", "rose",
+    "smote", "smote-tomek", "adasyn",
+    "smote-nc", "smote-enn"
+  )
+)
+
+cat("🚀 Iniciando processamento de", nrow(config), "combinações...\n")
+
+metrics_final <- purrr::pmap_dfr(config, function(tipo_modelo, reamostragem) {
+  avaliar_modelo_geral(
+    nome = paste(tipo_modelo, reamostragem, sep = "_"),
+    tipo_modelo = tipo_modelo,
+    reamostragem = reamostragem,
+    cv_folds = cv_folds,
+    data = dados
+  )
+})
+
+time_end <- Sys.time()
+
+message("Tempo total: ",
+        round(difftime(time_end, time_start, units = "hours"),2), "horas")
+# Salvar resultados
+write.csv(metrics_final, "metricas_completas_creditcard.csv", row.names = FALSE)
+
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+# 4. Salvamento
+# 4.1. Salvar o arquivo bruto com todos os folds e métricas
+# (Caso queira analisar a variância entre os 10 folds depois)
+write.csv(metrics_final,
+          "metricas_detalhadas_CV_creditcard.csv",
+          row.names=FALSE)
+
+# 4.2. Criar e salvar um resumo (Ranking) para facilitar a leitura
+metrics_resumo <- metrics_final %>%
+  group_by(tipo_modelo, reamostragem, .metric) %>%
+  summarise(
+    media = mean(mean, na.rm = TRUE),
+    erro_padrao = mean(std_err, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(.metric, desc(media))
+
+write.csv(metrics_resumo, 
+          "resumo_ranking_modelos_creditcard.csv", 
+          row.names = FALSE)
+
+saveRDS(metrics_final, "metrics_final.rds")
+
+cat("✅ Arquivos salvos com sucesso!")
+
+```
+
+
+
+
+
+
+
+
+
+```{r}
+# 5. GRÁFICOS
+
+# Filtrando apenas a métrica ROC AUC para o gráfico
+df_grafico <- metrics_final %>% 
+  filter(.metric == "roc_auc") %>%
+  # Reordenar para o gráfico ficar visualmente organizado
+  mutate(reamostragem = reorder_within(reamostragem, mean, tipo_modelo))
+
+ggplot(df_grafico, aes(x = reamostragem, y = mean)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  # Adiciona as barras de erro baseadas no erro padrão dos 10 folds
+  geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err), 
+                width = 0.2, color = "orange") +
+  facet_wrap(~tipo_modelo, scales = "free_y") +
+  coord_flip() +
+  scale_x_reordered() +
+  theme_minimal() +
+  labs(
+    title = "Performance de AUC por Técnica",
+    subtitle = "Barras coloridas representam a média; linhas laranjas representam o erro padrão",
+    x = "Técnica de Reamostragem",
+    y = "Média da AUC"
+  )
+
+ggsave("performance_AUC_tecnica.png", width = 10, height = 8, dpi = 300)
+
+# Comparando ROC AUC vs PR AUC
+ggplot(metrics_final %>% filter(.metric %in% c("roc_auc", "pr_auc")), 
+       aes(x = reamostragem, y = mean, fill = .metric)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~tipo_modelo) +
+  coord_flip() +
+  scale_fill_brewer(palette = "Set1") +
+  theme_minimal() +
+  labs(
+    title = "ROC AUC vs PR AUC",
+    subtitle = "PR AUC costuma ser bem menor em dados desbalanceados",
+    x = "Técnica",
+    y = "Valor Médio",
+    fill = "Métrica"
+  )
+
+ggsave("ROC_ AUC_vs_PR_AUC.png", width = 10, height = 8, dpi = 300)
+
+```
+
+
+
+
+
+```{r}
+# ------------------------------------------------------------
+# 6. MÉTRICAS AGREGADAS (Resumo Consolidado)
+# ------------------------------------------------------------
+
+metrics_agregadas <- metrics_final %>%
+  select(tipo_modelo, reamostragem, .metric, mean, std_err, n) %>%
+  # Criamos colunas de Intervalo de Confiança baseadas no erro padrão da CV
+  mutate(
+    ci_lower = mean - 1.96 * std_err,
+    ci_upper = mean + 1.96 * std_err
+  ) %>%
+  arrange(.metric, desc(mean))
+
+# Se quiseres uma tabela larga (uma linha por modelo/técnica com as métricas principais)
+metrics_wide <- metrics_agregadas %>%
+  select(tipo_modelo, reamostragem, .metric, mean) %>%
+  tidyr::pivot_wider(names_from = .metric, values_from = mean)
+
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+# ------------------------------------------------------------
+# 7. Ranking por AUC (ROC e PR)
+# ------------------------------------------------------------
+
+ranking_vencedores <- metrics_agregadas %>%
+  filter(.metric %in% c("roc_auc", "pr_auc")) %>%
+  group_by(.metric) %>%
+  arrange(.metric, desc(mean)) %>%
+  mutate(posicao = row_number()) %>%
+  ungroup()
+
+# Top 5 Modelos por ROC AUC
+top_roc <- ranking_vencedores %>% filter(.metric == "roc_auc", posicao <= 5)
+
+# Top 5 Modelos por PR AUC (Geralmente mais difícil de conseguir valores altos)
+top_pr <- ranking_vencedores %>% filter(.metric == "pr_auc", posicao <= 5)
+
+```
+
+
+
+
+
+
+
+```{r}
+# ------------------------------------------------------------
+# 8. Salvamento Final
+# ------------------------------------------------------------
+
+write.csv(metrics_agregadas, 
+          "metricas_agregadas_CV_10f_creditcard.csv", 
+          row.names = FALSE)
+
+write.csv(ranking_vencedores, 
+          "ranking_modelos_vencedores_creditcard.csv", 
+          row.names = FALSE)
+
+# Guardar a tabela larga para conferência rápida no Excel
+write.csv(metrics_wide, 
+          "tabela_comparativa_metricas_wide.csv", 
+          row.names = FALSE)
+
+```
+
+
+
+
+
+
+
+```{r}
+# ------------------------------------------------------------
+# 9. Gráfico das Médias com Intervalo de Confiança (IC)
+# ------------------------------------------------------------
+
+ggplot(metrics_agregadas %>% filter(.metric == "roc_auc"), 
+       aes(x = reorder(reamostragem, mean), 
+           y = mean, 
+           fill = tipo_modelo)) +
+  geom_col(alpha = 0.7, position = "dodge") +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), 
+                width = 0.3, 
+                position = position_dodge(0.9)) +
+  facet_wrap(~tipo_modelo, scales = "free_y") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Média de ROC AUC com Intervalo de Confiança (95%)",
+    subtitle = "Baseado em 10-fold Cross-Validation",
+    x = "Técnica de Reamostragem",
+    y = "Média AUC",
+    fill = "Modelo"
+  )
+
+```
+
